@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build and package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must match vX.Y.Z (got ${GITHUB_REF_NAME})" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          binary="target/${TARGET}/release/ports"
+          archive="ports-macos-${ARCH}.tar.gz"
+          staging="${RUNNER_TEMP}/ports-${ARCH}"
+
+          cargo build --release --target "${TARGET}"
+          test -x "${binary}"
+          rm -rf "${staging}"
+          mkdir -p "${staging}"
+          cp "${binary}" "${staging}/ports"
+          chmod 0755 "${staging}/ports"
+          tar -C "${staging}" -czf "${archive}" ports
+          test -s "${archive}"
+
+      - name: Upload architecture artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ports-${{ matrix.arch }}
+          path: ports-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: macos-14
+    steps:
+      - name: Download architecture artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ports-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          arm="ports-macos-arm64.tar.gz"
+          intel="ports-macos-x86_64.tar.gz"
+          test -s "${arm}"
+          test -s "${intel}"
+          shasum -a 256 "${arm}" "${intel}" > checksums.txt
+          test "$(wc -l < checksums.txt | tr -d ' ')" -eq 2
+          cat checksums.txt
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          assets=("ports-macos-arm64.tar.gz" "ports-macos-x86_64.tar.gz" checksums.txt)
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${assets[@]}" --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${tag}" "${assets[@]}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Ports ${tag#v}" \
+              --generate-notes \
+              --verify-tag
+          fi
+
+  tap:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: macos-14
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Download architecture artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ports-*
+          merge-multiple: true
+
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: noahlin34/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+          fetch-depth: 0
+
+      - name: Render and publish formula
+        shell: bash
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAP_TOKEN}" ]]; then
+            echo "HOMEBREW_TAP_TOKEN is required to update noahlin34/homebrew-tap" >&2
+            exit 1
+          fi
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must match vX.Y.Z (got ${GITHUB_REF_NAME})" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          arm_archive="ports-macos-arm64.tar.gz"
+          intel_archive="ports-macos-x86_64.tar.gz"
+          test -s "${arm_archive}"
+          test -s "${intel_archive}"
+          arm_sha="$(shasum -a 256 "${arm_archive}" | cut -d ' ' -f 1)"
+          intel_sha="$(shasum -a 256 "${intel_archive}" | cut -d ' ' -f 1)"
+          export VERSION="${version}" ARM_SHA="${arm_sha}" INTEL_SHA="${intel_sha}"
+
+          ruby <<'RUBY'
+          version = ENV.fetch("VERSION")
+          arm_sha = ENV.fetch("ARM_SHA")
+          intel_sha = ENV.fetch("INTEL_SHA")
+          abort "invalid arm64 checksum" unless arm_sha.match?(/\A[0-9a-f]{64}\z/)
+          abort "invalid x86_64 checksum" unless intel_sha.match?(/\A[0-9a-f]{64}\z/)
+
+          source = File.read("Formula/ports.rb")
+          arm_url = "https://github.com/noahlin34/ports/releases/download/v#{version}/ports-macos-arm64.tar.gz"
+          intel_url = "https://github.com/noahlin34/ports/releases/download/v#{version}/ports-macos-x86_64.tar.gz"
+          source = source.sub(%r{https://github\.com/noahlin34/ports/releases/latest/download/ports-macos-arm64\.tar\.gz}, arm_url)
+          source = source.sub(%r{https://github\.com/noahlin34/ports/releases/latest/download/ports-macos-x86_64\.tar\.gz}, intel_url)
+          source = source.sub(/(^  homepage "[^\n]+"\n)/) { |match| "#{match}  version \"#{version}\"\n" }
+          source = source.sub(/(    url "#{Regexp.escape(arm_url)}"\n)/) { |match| "#{match}    sha256 \"#{arm_sha}\"\n" }
+          source = source.sub(/(    url "#{Regexp.escape(intel_url)}"\n)/) { |match| "#{match}    sha256 \"#{intel_sha}\"\n" }
+          abort "formula template did not contain both architecture URLs" unless source.include?("sha256 \"#{arm_sha}\"") && source.include?("sha256 \"#{intel_sha}\"")
+
+          Dir.mkdir("tap/Formula") unless Dir.exist?("tap/Formula")
+          File.write("tap/Formula/ports.rb", source)
+          RUBY
+
+          git -C tap config user.name "github-actions[bot]"
+          git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C tap add Formula/ports.rb
+          if git -C tap diff --cached --quiet -- Formula/ports.rb; then
+            echo "Homebrew formula already points at ${version}"
+            exit 0
+          fi
+          git -C tap commit -m "ports ${version}"
+          git -C tap remote set-head origin -a
+          tap_branch="$(git -C tap symbolic-ref --short refs/remotes/origin/HEAD | sed 's#^origin/##')"
+          git -C tap push origin "HEAD:${tap_branch}"
