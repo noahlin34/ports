@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ports::{
     discovery::{discover, terminate_pid},
     filter::Filter,
-    model::{Protocol, ServiceRecord},
+    model::{ProcessMetadata, Protocol, ServiceRecord},
 };
 
 const HISTORY_LIMIT: usize = 128;
@@ -73,20 +73,17 @@ impl ConfirmKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Confirmation {
     pub kind: ConfirmKind,
-    pub process: String,
-    pub pid: u32,
+    pub process: ProcessMetadata,
     pub endpoint: String,
+    pub sockets: Vec<String>,
+    pub connection_count: usize,
+    pub blocked_reason: Option<String>,
+    pub input: String,
 }
 
 impl Confirmation {
-    pub fn prompt(&self) -> String {
-        format!(
-            "Send {} to {} (PID {}) on {}?",
-            self.kind.signal(),
-            self.process,
-            self.pid,
-            self.endpoint
-        )
+    pub fn is_blocked(&self) -> bool {
+        self.blocked_reason.is_some()
     }
 }
 
@@ -128,19 +125,14 @@ impl fmt::Display for HistoryEvent {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum Overlay {
+    #[default]
     None,
     Search,
     Help,
     BinaryPath(String),
-    Confirm(Confirmation),
-}
-
-impl Default for Overlay {
-    fn default() -> Self {
-        Self::None
-    }
+    Confirm(Box<Confirmation>),
 }
 
 /// All mutable UI state lives here. Rendering is intentionally a pure view of
@@ -408,12 +400,42 @@ impl App {
 
     pub fn request_confirmation(&mut self, kind: ConfirmKind) {
         if let Some(service) = self.selected_service() {
-            self.overlay = Overlay::Confirm(Confirmation {
+            let pid = service.process.pid;
+            let blocked_reason = if pid <= 1 {
+                Some(format!("refusing to terminate system process (PID {pid})"))
+            } else if pid == std::process::id() {
+                Some(format!(
+                    "refusing to terminate the current ports process (PID {pid})"
+                ))
+            } else {
+                None
+            };
+
+            let mut sockets: Vec<String> = self
+                .services
+                .iter()
+                .filter(|s| s.process.pid == pid)
+                .map(|s| format!("{} {}", s.protocol, s.local))
+                .collect();
+            sockets.sort();
+            sockets.dedup();
+
+            let connection_count: usize = self
+                .services
+                .iter()
+                .filter(|s| s.process.pid == pid)
+                .map(|s| s.connections.len())
+                .sum();
+
+            self.overlay = Overlay::Confirm(Box::new(Confirmation {
                 kind,
-                process: service.process.name.clone(),
-                pid: service.process.pid,
+                process: service.process.clone(),
                 endpoint: service.local.to_string(),
-            });
+                sockets,
+                connection_count,
+                blocked_reason,
+                input: String::new(),
+            }));
             self.status = None;
         } else {
             self.status = Some("nothing selected".to_owned());
@@ -424,23 +446,31 @@ impl App {
         let Overlay::Confirm(confirmation) = self.overlay.clone() else {
             return Ok(());
         };
+        if let Some(reason) = &confirmation.blocked_reason {
+            self.overlay = Overlay::None;
+            self.error = Some(reason.clone());
+            return Ok(());
+        }
         self.overlay = Overlay::None;
-        match terminate_pid(confirmation.pid, confirmation.kind.force()) {
+        match terminate_pid(confirmation.process.pid, confirmation.kind.force()) {
             Ok(()) => {
+                self.error = None;
                 self.status = Some(format!(
                     "{} sent to {} (PID {})",
                     confirmation.kind.signal(),
-                    confirmation.process,
-                    confirmation.pid
+                    confirmation.process.name,
+                    confirmation.process.pid
                 ));
                 let _ = self.refresh();
                 Ok(())
             }
             Err(error) => {
-                self.status = Some(format!(
-                    "could not signal PID {}: {error}",
-                    confirmation.pid
-                ));
+                let message = format!(
+                    "could not signal {} (PID {}): {error}",
+                    confirmation.process.name, confirmation.process.pid
+                );
+                self.error = Some(message);
+                self.status = Some("terminate failed".to_owned());
                 Err(error).context("terminate selected process")
             }
         }
@@ -501,15 +531,65 @@ impl App {
     }
 
     fn handle_confirm_key(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+        let Overlay::Confirm(confirmation) = &self.overlay else {
+            return Ok(());
+        };
+
+        if let Some(reason) = &confirmation.blocked_reason {
+            if matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Enter
+                    | KeyCode::Char('q')
+                    | KeyCode::Char('n')
+                    | KeyCode::Char('N')
+                    | KeyCode::Char('y')
+                    | KeyCode::Char('Y')
+            ) {
+                let reason = reason.clone();
                 self.overlay = Overlay::None;
-                self.status = Some("action cancelled".to_owned());
+                self.error = Some(reason);
             }
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let _ = self.confirm();
-            }
-            _ => {}
+            return Ok(());
+        }
+
+        match confirmation.kind {
+            ConfirmKind::Terminate => match key.code {
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.overlay = Overlay::None;
+                    self.status = Some("action cancelled".to_owned());
+                }
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let _ = self.confirm();
+                }
+                _ => {}
+            },
+            ConfirmKind::Kill => match key.code {
+                KeyCode::Esc => {
+                    self.overlay = Overlay::None;
+                    self.status = Some("action cancelled".to_owned());
+                }
+                KeyCode::Backspace => {
+                    if let Overlay::Confirm(c) = &mut self.overlay {
+                        c.input.pop();
+                    }
+                }
+                KeyCode::Enter => {
+                    if confirmation.input.trim() == "KILL" {
+                        let _ = self.confirm();
+                    } else {
+                        self.status = Some("type KILL to confirm force-kill".to_owned());
+                    }
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Overlay::Confirm(c) = &mut self.overlay {
+                        if c.input.len() < 16 {
+                            c.input.push(character);
+                        }
+                    }
+                }
+                _ => {}
+            },
         }
         Ok(())
     }
@@ -736,5 +816,155 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.search_query, "8");
+    }
+
+    #[test]
+    fn request_confirmation_gathers_process_sockets_and_connections() {
+        let mut proc = ProcessMetadata::new(42, "proc-42");
+        proc.command = Some("node server.js".to_owned());
+        proc.user = Some("developer".to_owned());
+
+        let s1 = ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+            SocketState::Listening,
+            proc.clone(),
+            None,
+        );
+        let s2 = ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000),
+            SocketState::Listening,
+            proc.clone(),
+            None,
+        );
+        let mut s3 = ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000),
+            SocketState::Listening,
+            proc,
+            None,
+        );
+        s3.add_connection(ports::model::ConnectionRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000),
+            Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51234),
+            SocketState::Established,
+            ProcessMetadata::new(42, "proc-42"),
+        ));
+        let mut app = App::from_services(vec![s1, s2, s3]);
+        app.request_confirmation(ConfirmKind::Terminate);
+
+        let Overlay::Confirm(confirmation) = &app.overlay else {
+            panic!("expected Confirm overlay");
+        };
+        assert_eq!(confirmation.kind, ConfirmKind::Terminate);
+        assert_eq!(confirmation.process.pid, 42);
+        assert_eq!(confirmation.process.name, "proc-42");
+        assert_eq!(
+            confirmation.process.command.as_deref(),
+            Some("node server.js")
+        );
+        assert_eq!(confirmation.sockets.len(), 3);
+        assert_eq!(confirmation.connection_count, 1);
+        assert!(confirmation.blocked_reason.is_none());
+        assert!(!confirmation.is_blocked());
+    }
+
+    #[test]
+    fn request_confirmation_blocks_system_pids_and_self() {
+        let s_init = service(80, 1, SocketState::Listening);
+        let mut app = App::from_services(vec![s_init]);
+        app.request_confirmation(ConfirmKind::Terminate);
+
+        let Overlay::Confirm(confirmation) = &app.overlay else {
+            panic!("expected Confirm overlay");
+        };
+        assert!(confirmation.is_blocked());
+        assert!(confirmation
+            .blocked_reason
+            .as_ref()
+            .unwrap()
+            .contains("system process"));
+
+        // Dismissing a blocked confirmation overlay sets error
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.error.as_ref().unwrap().contains("system process"));
+
+        // Test self PID
+        let self_pid = std::process::id();
+        let s_self = service(9999, self_pid, SocketState::Listening);
+        let mut app_self = App::from_services(vec![s_self]);
+        app_self.request_confirmation(ConfirmKind::Kill);
+        let Overlay::Confirm(conf_self) = &app_self.overlay else {
+            panic!("expected Confirm overlay");
+        };
+        assert!(conf_self.is_blocked());
+        assert!(conf_self
+            .blocked_reason
+            .as_ref()
+            .unwrap()
+            .contains("current ports process"));
+    }
+
+    #[test]
+    fn force_kill_requires_typing_kill_to_confirm() {
+        let s = service(8080, 99999, SocketState::Listening);
+        let mut app = App::from_services(vec![s]);
+        app.request_confirmation(ConfirmKind::Kill);
+
+        // Pressing Enter with empty input does not confirm
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.overlay, Overlay::Confirm(_)));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("type KILL to confirm force-kill")
+        );
+
+        // Type 'K', 'I', 'L'
+        app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.overlay, Overlay::Confirm(_)));
+
+        // Backspace and type 'L' then another 'L' to make "KILL"
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE))
+            .unwrap();
+
+        let Overlay::Confirm(c) = &app.overlay else {
+            panic!("expected Confirm overlay");
+        };
+        assert_eq!(c.input, "KILL");
+
+        // Esc cancels
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.status.as_deref(), Some("action cancelled"));
+    }
+
+    #[test]
+    fn terminate_confirmation_accepts_y_and_enter_and_cancels_on_n() {
+        let s = service(8080, 99999, SocketState::Listening);
+        let mut app = App::from_services(vec![s]);
+        app.request_confirmation(ConfirmKind::Terminate);
+
+        // 'n' cancels
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.status.as_deref(), Some("action cancelled"));
     }
 }
