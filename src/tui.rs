@@ -156,13 +156,11 @@ fn text_width(text: &str) -> u16 {
 }
 
 fn footer_layout(area: Rect, app: &App) -> FooterLayout {
-    let left = if let Some(error) = &app.error {
-        error.clone()
-    } else if let Some(status) = &app.status {
-        status.clone()
-    } else {
-        "ready · live discovery".to_owned()
-    };
+    let left = app
+        .error
+        .clone()
+        .or_else(|| app.status.clone())
+        .unwrap_or_default();
     let refreshed = app.last_refresh.map_or_else(
         || "never".to_owned(),
         |instant| {
@@ -174,8 +172,9 @@ fn footer_layout(area: Rect, app: &App) -> FooterLayout {
             }
         },
     );
+    let left_separator = if left.is_empty() { "" } else { "  " };
     let prefix_width = text_width(&left)
-        .saturating_add(text_width("  "))
+        .saturating_add(text_width(left_separator))
         .saturating_add(text_width(&format!("last refresh {refreshed}")))
         .saturating_add(text_width("              "))
         .saturating_add(text_width("↑↓/jk"))
@@ -1093,9 +1092,9 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverSt
             ViewMode::Services => {
                 let service = row.service();
                 let process = if service.process.name.is_empty() {
-                    format!("PID {}", service.process.pid)
+                    "—".to_owned()
                 } else {
-                    format!("{}  {}", service.process.name, service.process.pid)
+                    service.process.name.clone()
                 };
                 vec![
                     Cell::from(service.local.port.to_string()).style(port_style),
@@ -1130,9 +1129,9 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverSt
             ViewMode::All => match row {
                 ViewRow::Service(service) => {
                     let process = if service.process.name.is_empty() {
-                        format!("PID {}", service.process.pid)
+                        "—".to_owned()
                     } else {
-                        format!("{}  {}", service.process.name, service.process.pid)
+                        service.process.name.clone()
                     };
                     vec![
                         Cell::from(service.local.port.to_string()).style(port_style),
@@ -1460,9 +1459,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverStat
     } else {
         theme.muted()
     };
+    let left_separator = if footer.left.is_empty() { "" } else { "  " };
     let mut spans = vec![
         Span::styled(footer.left, left_style),
-        Span::raw("  "),
+        Span::raw(left_separator),
         Span::styled(format!("last refresh {}", footer.refreshed), theme.muted()),
         Span::raw("              "),
         Span::styled("↑↓/jk", Style::default().fg(theme.accent)),
