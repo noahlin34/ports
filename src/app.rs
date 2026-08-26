@@ -133,6 +133,7 @@ pub enum Overlay {
     None,
     Search,
     Help,
+    BinaryPath(String),
     Confirm(Confirmation),
 }
 
@@ -392,6 +393,19 @@ impl App {
         };
     }
 
+    pub fn show_binary_path(&mut self) {
+        let Some(path) = self
+            .selected_service()
+            .and_then(|service| service.process.executable.as_deref())
+            .map(|path| path.display().to_string())
+        else {
+            self.status = Some("selected process has no executable path".to_owned());
+            return;
+        };
+        self.overlay = Overlay::BinaryPath(path);
+        self.status = None;
+    }
+
     pub fn request_confirmation(&mut self, kind: ConfirmKind) {
         if let Some(service) = self.selected_service() {
             self.overlay = Overlay::Confirm(Confirmation {
@@ -445,6 +459,12 @@ impl App {
                     key.code,
                     KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
                 ) {
+                    self.overlay = Overlay::None;
+                }
+                Ok(())
+            }
+            Overlay::BinaryPath(_) => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('p')) {
                     self.overlay = Overlay::None;
                 }
                 Ok(())
@@ -507,6 +527,7 @@ impl App {
             KeyCode::End => self.select_end(),
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::Enter => self.toggle_inspection(),
+            KeyCode::Char('p') => self.show_binary_path(),
             KeyCode::Char('r') => {
                 let _ = self.refresh();
             }
@@ -615,7 +636,10 @@ fn is_likely_http(service: &ServiceRecord) -> bool {
 mod tests {
     use super::*;
     use ports::model::{Endpoint, ProcessMetadata, SocketState};
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        path::PathBuf,
+    };
 
     fn service(port: u16, pid: u32, state: SocketState) -> ServiceRecord {
         ServiceRecord::new(
@@ -660,6 +684,24 @@ mod tests {
             app.push_history(HistoryKind::Opened, number.to_string());
         }
         assert_eq!(app.history.len(), HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn binary_path_overlay_reveals_full_executable_path() {
+        let mut selected = service(8080, 7, SocketState::Listening);
+        selected.process.executable = Some(PathBuf::from("/usr/libexec/remoted"));
+        let mut app = App::from_services(vec![selected]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.overlay,
+            Overlay::BinaryPath("/usr/libexec/remoted".to_owned())
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.overlay, Overlay::None);
     }
 
     #[test]
