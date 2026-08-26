@@ -70,6 +70,7 @@ ports inspect 8080 --json
 | `/` | Search |
 | `Tab` | Switch view/detail focus |
 | `Enter` | Inspect the selected item |
+| `p` | Show the full executable path |
 | `r` | Refresh |
 | `c` | Copy address |
 | `u` | Copy URL |
