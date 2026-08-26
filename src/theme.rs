@@ -94,4 +94,24 @@ impl Theme {
             }
         }
     }
+
+    pub fn hover_row(self) -> Style {
+        Style::default().fg(self.text).bg(Color::Rgb(36, 42, 53))
+    }
+
+    pub fn hover_border(self) -> Style {
+        Style::default().fg(self.accent_soft)
+    }
+
+    pub fn hover_button(self) -> Style {
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    }
+
+    pub fn hover_danger_button(self) -> Style {
+        Style::default()
+            .fg(self.danger)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    }
 }
