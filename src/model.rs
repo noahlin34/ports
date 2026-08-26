@@ -395,7 +395,10 @@ impl fmt::Display for SocketRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ServiceRecord {
     pub protocol: Protocol,
+    /// The deterministic primary binding used by compact/legacy views.
     pub local: LocalEndpoint,
+    /// Every unique local endpoint represented by this service.
+    pub bindings: Vec<Endpoint>,
     pub state: SocketState,
     pub scope: NetworkScope,
     pub process: ProcessMetadata,
@@ -414,12 +417,31 @@ impl ServiceRecord {
         let scope = local.scope();
         Self {
             protocol,
-            local,
+            local: local.clone(),
+            bindings: vec![local],
             state,
             scope,
             process,
             service,
             connections: Vec::new(),
+        }
+    }
+
+    /// Add a local endpoint while preserving the service's primary binding and
+    /// broadest exposure summary.
+    pub fn add_binding(&mut self, binding: Endpoint) {
+        if !self.bindings.contains(&binding) {
+            self.bindings.push(binding);
+            self.bindings.sort();
+        }
+        if let Some(primary) = self.bindings.first() {
+            self.local = primary.clone();
+            self.scope = self
+                .bindings
+                .iter()
+                .map(Endpoint::scope)
+                .min()
+                .unwrap_or_else(|| primary.scope());
         }
     }
 
@@ -475,6 +497,7 @@ impl Ord for ServiceRecord {
             .cmp(&other.local.port)
             .then_with(|| self.protocol.cmp(&other.protocol))
             .then_with(|| self.local.cmp(&other.local))
+            .then_with(|| self.bindings.cmp(&other.bindings))
             .then_with(|| self.scope.cmp(&other.scope))
             .then_with(|| self.state.cmp(&other.state))
             .then_with(|| self.process.cmp(&other.process))
