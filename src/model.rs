@@ -229,7 +229,9 @@ fn is_tailscale_v6(address: Ipv6Addr) -> bool {
 #[derive(Clone, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ProcessMetadata {
     pub pid: u32,
+    /// The short executable name used in compact views.
     pub name: String,
+    /// The full executable path when the platform exposes it.
     pub executable: Option<PathBuf>,
     pub command: Option<String>,
     pub cwd: Option<PathBuf>,
