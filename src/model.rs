@@ -36,9 +36,10 @@ impl fmt::Display for Protocol {
 }
 
 /// States reported by TCP and UDP socket discovery.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SocketState {
+    #[default]
     Listening,
     Established,
     SynSent,
@@ -54,12 +55,6 @@ pub enum SocketState {
     Unconnected,
     /// A platform-specific state that is not represented by the portable set.
     Other(String),
-}
-
-impl Default for SocketState {
-    fn default() -> Self {
-        Self::Listening
-    }
 }
 
 impl SocketState {
@@ -172,13 +167,21 @@ impl NetworkScope {
             Self::Loopback
         } else if is_tailscale_v6(address) {
             Self::Tailscale
-        } else if address.is_unicast_link_local() {
+        } else if Self::is_ipv6_link_local(address) {
             Self::LinkLocal
-        } else if address.is_unique_local() {
+        } else if Self::is_ipv6_unique_local(address) {
             Self::Private
         } else {
             Self::External
         }
+    }
+
+    fn is_ipv6_link_local(address: Ipv6Addr) -> bool {
+        (address.segments()[0] & 0xffc0) == 0xfe80
+    }
+
+    fn is_ipv6_unique_local(address: Ipv6Addr) -> bool {
+        (address.segments()[0] & 0xfe00) == 0xfc00
     }
 
     pub const fn label(self) -> &'static str {

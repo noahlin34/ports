@@ -126,18 +126,19 @@ pub struct Filters {
 
 impl Filters {
     pub fn to_filter(&self) -> Filter {
-        let mut filter = Filter::default();
-        filter.protocol = self.protocol;
-        filter.state = self.state.clone();
-        filter.scope = self.scope;
-        filter.process = self.process.clone();
-        filter.pid = self.pid;
-        filter.address = self.address.clone();
-        filter.cwd = self.cwd.clone();
-        filter.search = self.search.clone();
-        filter.current_user = self.current_user;
-        filter.active_connection = self.active_connections;
-        filter
+        Filter {
+            pid: self.pid,
+            process: self.process.clone(),
+            protocol: self.protocol,
+            address: self.address.clone(),
+            cwd: self.cwd.clone(),
+            state: self.state.clone(),
+            scope: self.scope,
+            current_user: self.current_user,
+            active_connection: self.active_connections,
+            search: self.search.clone(),
+            ..Filter::default()
+        }
     }
 
     fn matches_user(&self, process: &ProcessMetadata) -> bool {
@@ -407,7 +408,7 @@ pub fn resolve_kill_targets(services: &[ServiceRecord], port: u16) -> Vec<KillTa
             });
         }
     }
-    targets.sort_by(|left, right| left.process.pid.cmp(&right.process.pid));
+    targets.sort_by_key(|target| target.process.pid);
     targets
 }
 

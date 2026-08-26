@@ -1551,8 +1551,6 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverStat
     let footer = footer_layout(area, app);
     let left_style = if app.error.is_some() {
         theme.danger()
-    } else if app.status.is_some() {
-        theme.muted()
     } else {
         theme.muted()
     };

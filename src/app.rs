@@ -309,8 +309,10 @@ impl App {
     #[cfg(test)]
     pub fn from_services(mut services: Vec<ServiceRecord>) -> Self {
         sort_services(&mut services);
-        let mut app = Self::default();
-        app.services = services;
+        let mut app = Self {
+            services,
+            ..Self::default()
+        };
         app.recompute_visible();
         app.last_refresh = Some(Instant::now());
         app.next_refresh = Instant::now() + REFRESH_INTERVAL;

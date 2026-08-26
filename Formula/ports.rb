@@ -3,8 +3,8 @@ class Ports < Formula
   homepage "https://github.com/noahlin34/ports"
   license "MIT"
 
-  # The release workflow renders versioned URLs and SHA-256 values before this
-  # formula is pushed to noahlin34/homebrew-tap.
+  # The release workflow renders the exact tag URLs and SHA-256 values, then
+  # commits the updated formula here and to noahlin34/homebrew-tap.
   on_arm do
     url "https://github.com/noahlin34/ports/releases/latest/download/ports-macos-arm64.tar.gz"
   end

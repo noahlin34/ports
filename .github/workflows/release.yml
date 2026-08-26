@@ -1,3 +1,10 @@
+# Release workflow: builds architecture-specific macOS `ports` binaries,
+# publishes a GitHub release, and synchronizes the Homebrew formula in
+# this repository and in noahlin34/homebrew-tap.
+#
+# Tags must look like `v<semver>` (for example, `v0.1.0`). The tap update is a
+# direct commit authenticated by the fine-grained HOMEBREW_TAP_TOKEN secret.
+
 name: Release
 
 on:
@@ -6,184 +13,427 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    name: Build macOS ${{ matrix.arch }}
+    name: Build ports (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: arm64
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
           - arch: x86_64
-            runner: macos-13
+            runner: macos-15
             target: x86_64-apple-darwin
+    permissions:
+      contents: read
+
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Install Rust
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build and package
-        shell: bash
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build and package binary
         env:
-          TARGET: ${{ matrix.target }}
           ARCH: ${{ matrix.arch }}
+          REF_NAME: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
         run: |
           set -euo pipefail
-
-          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Release tags must match vX.Y.Z (got ${GITHUB_REF_NAME})" >&2
+          VERSION="${REF_NAME#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release tag must contain a semantic version (got \"$REF_NAME\")"
             exit 1
           fi
-          version="${GITHUB_REF_NAME#v}"
-          binary="target/${TARGET}/release/ports"
-          archive="ports-macos-${ARCH}.tar.gz"
-          staging="${RUNNER_TEMP}/ports-${ARCH}"
 
-          cargo build --release --target "${TARGET}"
-          test -x "${binary}"
-          rm -rf "${staging}"
-          mkdir -p "${staging}"
-          cp "${binary}" "${staging}/ports"
-          chmod 0755 "${staging}/ports"
-          tar -C "${staging}" -czf "${archive}" ports
-          test -s "${archive}"
+          BINARY="target/${TARGET}/release/ports"
+          ARCHIVE="ports-macos-${ARCH}.tar.gz"
+          STAGE="${RUNNER_TEMP}/ports-${ARCH}"
 
-      - name: Upload architecture artifact
+          cargo build --release --locked --target "$TARGET"
+          test -x "$BINARY"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp "$BINARY" "$STAGE/ports"
+          chmod 0755 "$STAGE/ports"
+          tar -C "$STAGE" -czf "$ARCHIVE" ports
+          test -s "$ARCHIVE"
+
+      - name: Upload architecture archive
         uses: actions/upload-artifact@v4
         with:
-          name: ports-${{ matrix.arch }}
-          path: ports-*.tar.gz
+          name: ports-${{ matrix.target }}
+          path: ports-macos-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    name: Publish GitHub release
+  package:
+    name: Assemble release archives
     needs: build
-    runs-on: macos-14
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      arm_sha256: ${{ steps.checksums.outputs.arm_sha256 }}
+      intel_sha256: ${{ steps.checksums.outputs.intel_sha256 }}
+
     steps:
-      - name: Download architecture artifacts
+      - name: Resolve tag version
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${REF_NAME#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release tag must contain a semantic version (got \"$REF_NAME\")"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download architecture archives
         uses: actions/download-artifact@v4
         with:
-          pattern: ports-*
-          merge-multiple: true
+          path: dist
+          pattern: ports-*-apple-darwin
+          merge-multiple: false
+
+      - name: Collect release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp dist/ports-aarch64-apple-darwin/ports-macos-arm64.tar.gz .
+          cp dist/ports-x86_64-apple-darwin/ports-macos-x86_64.tar.gz .
+          test -s ports-macos-arm64.tar.gz
+          test -s ports-macos-x86_64.tar.gz
 
       - name: Generate checksums
+        id: checksums
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          arm="ports-macos-arm64.tar.gz"
-          intel="ports-macos-x86_64.tar.gz"
-          test -s "${arm}"
-          test -s "${intel}"
-          shasum -a 256 "${arm}" "${intel}" > checksums.txt
+          ARM_SHA256="$(shasum -a 256 ports-macos-arm64.tar.gz | awk '{print $1}')"
+          INTEL_SHA256="$(shasum -a 256 ports-macos-x86_64.tar.gz | awk '{print $1}')"
+          [[ "$ARM_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$INTEL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          {
+            shasum -a 256 ports-macos-arm64.tar.gz
+            shasum -a 256 ports-macos-x86_64.tar.gz
+          } > checksums.txt
           test "$(wc -l < checksums.txt | tr -d ' ')" -eq 2
           cat checksums.txt
+          echo "arm_sha256=${ARM_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "intel_sha256=${INTEL_SHA256}" >> "$GITHUB_OUTPUT"
 
-      - name: Create or update GitHub release
-        shell: bash
+      - name: Upload release archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: ports-release
+          path: |
+            ports-macos-*.tar.gz
+            checksums.txt
+          if-no-files-found: error
+
+  sync_source_formula:
+    name: Update source formula
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Update formula metadata
         env:
-          GH_TOKEN: ${{ github.token }}
+          ARM_SHA256: ${{ needs.package.outputs.arm_sha256 }}
+          INTEL_SHA256: ${{ needs.package.outputs.intel_sha256 }}
+          VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("Formula/ports.rb")
+          text = path.read_text()
+          version = os.environ["VERSION"]
+          arm_sha256 = os.environ["ARM_SHA256"]
+          intel_sha256 = os.environ["INTEL_SHA256"]
+
+          if not re.fullmatch(r"[0-9a-f]{64}", arm_sha256):
+              raise SystemExit("invalid arm64 SHA-256")
+          if not re.fullmatch(r"[0-9a-f]{64}", intel_sha256):
+              raise SystemExit("invalid x86_64 SHA-256")
+
+          version_line = f'  version "{version}"\n'
+          text, version_count = re.subn(
+              r'^  version "[^"]+"\n?',
+              version_line,
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if version_count == 0:
+              text, homepage_count = re.subn(
+                  r'(^  homepage "[^\n]+"\n)',
+                  lambda match: match.group(1) + version_line,
+                  text,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+              if homepage_count != 1:
+                  raise SystemExit("formula template is missing its homepage")
+          elif version_count != 1:
+              raise SystemExit(f"expected one version line, found {version_count}")
+
+          def replace_architecture(text, name, url, sha256):
+              block_pattern = re.compile(
+                  rf'(^  {name} do\n)(.*?)(^  end\n)',
+                  flags=re.MULTILINE | re.DOTALL,
+              )
+
+              def replace_block(match):
+                  body = match.group(2)
+                  body, url_count = re.subn(
+                      r'^    url "[^"]+"\n?',
+                      f'    url "{url}"\n',
+                      body,
+                      count=1,
+                      flags=re.MULTILINE,
+                  )
+                  if url_count != 1:
+                      raise SystemExit(f"{name} formula block is missing its URL")
+                  body = re.sub(
+                      r'^    sha256 "[0-9a-f]{64}"\n?',
+                      "",
+                      body,
+                      count=1,
+                      flags=re.MULTILINE,
+                  )
+                  body = body.rstrip("\n") + f'\n    sha256 "{sha256}"\n'
+                  return match.group(1) + body + match.group(3)
+
+              text, block_count = block_pattern.subn(replace_block, text, count=1)
+              if block_count != 1:
+                  raise SystemExit(f"formula is missing its {name} block")
+              return text
+
+          arm_url = (
+              f"https://github.com/noahlin34/ports/releases/download/"
+              f"v{version}/ports-macos-arm64.tar.gz"
+          )
+          intel_url = (
+              f"https://github.com/noahlin34/ports/releases/download/"
+              f"v{version}/ports-macos-x86_64.tar.gz"
+          )
+          text = replace_architecture(text, "on_arm", arm_url, arm_sha256)
+          text = replace_architecture(text, "on_intel", intel_url, intel_sha256)
+          path.write_text(text)
+          PY
+
+      - name: Commit formula update
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          assets=("ports-macos-arm64.tar.gz" "ports-macos-x86_64.tar.gz" checksums.txt)
-          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${tag}" "${assets[@]}" --repo "${GITHUB_REPOSITORY}" --clobber
-          else
-            gh release create "${tag}" "${assets[@]}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "Ports ${tag#v}" \
-              --generate-notes \
-              --verify-tag
+          if git diff --quiet -- Formula/ports.rb; then
+            echo "Source formula is already current."
+            exit 0
           fi
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/ports.rb
+          git commit -m "Update Homebrew formula for v${VERSION}"
+          git push origin HEAD:main
 
-  tap:
-    name: Update Homebrew tap
-    needs: release
-    runs-on: macos-14
+  release:
+    name: Publish GitHub release
+    needs: [package, sync_source_formula]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Download architecture artifacts
+      - name: Download release archives
         uses: actions/download-artifact@v4
         with:
-          pattern: ports-*
-          merge-multiple: true
+          name: ports-release
+          path: dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  update_tap:
+    name: Update Homebrew tap
+    needs: [package, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      ARM_SHA256: ${{ needs.package.outputs.arm_sha256 }}
+      INTEL_SHA256: ${{ needs.package.outputs.intel_sha256 }}
+      VERSION: ${{ needs.package.outputs.version }}
+
+    steps:
+      - name: Require tap token
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [[ -z "$TAP_TOKEN" ]]; then
+            echo "::error::Set HOMEBREW_TAP_TOKEN to a fine-grained token with Contents write access to noahlin34/homebrew-tap."
+            exit 1
+          fi
+
+      - name: Check out source formula
+        uses: actions/checkout@v5
+        with:
+          path: ports
+          ref: ${{ github.sha }}
 
       - name: Check out Homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: noahlin34/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: tap
           fetch-depth: 0
 
-      - name: Render and publish formula
-        shell: bash
+      - name: Update tap formula
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          source_path = Path("ports/Formula/ports.rb")
+          tap_path = Path("tap/Formula/ports.rb")
+          text = source_path.read_text()
+          version = os.environ["VERSION"]
+          arm_sha256 = os.environ["ARM_SHA256"]
+          intel_sha256 = os.environ["INTEL_SHA256"]
+
+          if not re.fullmatch(r"[0-9a-f]{64}", arm_sha256):
+              raise SystemExit("invalid arm64 SHA-256")
+          if not re.fullmatch(r"[0-9a-f]{64}", intel_sha256):
+              raise SystemExit("invalid x86_64 SHA-256")
+
+          version_line = f'  version "{version}"\n'
+          text, version_count = re.subn(
+              r'^  version "[^"]+"\n?',
+              version_line,
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if version_count == 0:
+              text, homepage_count = re.subn(
+                  r'(^  homepage "[^\n]+"\n)',
+                  lambda match: match.group(1) + version_line,
+                  text,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+              if homepage_count != 1:
+                  raise SystemExit("formula template is missing its homepage")
+          elif version_count != 1:
+              raise SystemExit(f"expected one version line, found {version_count}")
+
+          def replace_architecture(text, name, url, sha256):
+              block_pattern = re.compile(
+                  rf'(^  {name} do\n)(.*?)(^  end\n)',
+                  flags=re.MULTILINE | re.DOTALL,
+              )
+
+              def replace_block(match):
+                  body = match.group(2)
+                  body, url_count = re.subn(
+                      r'^    url "[^"]+"\n?',
+                      f'    url "{url}"\n',
+                      body,
+                      count=1,
+                      flags=re.MULTILINE,
+                  )
+                  if url_count != 1:
+                      raise SystemExit(f"{name} formula block is missing its URL")
+                  body = re.sub(
+                      r'^    sha256 "[0-9a-f]{64}"\n?',
+                      "",
+                      body,
+                      count=1,
+                      flags=re.MULTILINE,
+                  )
+                  body = body.rstrip("\n") + f'\n    sha256 "{sha256}"\n'
+                  return match.group(1) + body + match.group(3)
+
+              text, block_count = block_pattern.subn(replace_block, text, count=1)
+              if block_count != 1:
+                  raise SystemExit(f"formula is missing its {name} block")
+              return text
+
+          arm_url = (
+              f"https://github.com/noahlin34/ports/releases/download/"
+              f"v{version}/ports-macos-arm64.tar.gz"
+          )
+          intel_url = (
+              f"https://github.com/noahlin34/ports/releases/download/"
+              f"v{version}/ports-macos-x86_64.tar.gz"
+          )
+          text = replace_architecture(text, "on_arm", arm_url, arm_sha256)
+          text = replace_architecture(text, "on_intel", intel_url, intel_sha256)
+          tap_path.parent.mkdir(parents=True, exist_ok=True)
+          tap_path.write_text(text)
+          PY
+
+      - name: Commit tap update
         env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.package.outputs.version }}
         run: |
           set -euo pipefail
-          if [[ -z "${TAP_TOKEN}" ]]; then
-            echo "HOMEBREW_TAP_TOKEN is required to update noahlin34/homebrew-tap" >&2
-            exit 1
-          fi
-          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Release tags must match vX.Y.Z (got ${GITHUB_REF_NAME})" >&2
-            exit 1
-          fi
-          version="${GITHUB_REF_NAME#v}"
-          arm_archive="ports-macos-arm64.tar.gz"
-          intel_archive="ports-macos-x86_64.tar.gz"
-          test -s "${arm_archive}"
-          test -s "${intel_archive}"
-          arm_sha="$(shasum -a 256 "${arm_archive}" | cut -d ' ' -f 1)"
-          intel_sha="$(shasum -a 256 "${intel_archive}" | cut -d ' ' -f 1)"
-          export VERSION="${version}" ARM_SHA="${arm_sha}" INTEL_SHA="${intel_sha}"
-
-          ruby <<'RUBY'
-          version = ENV.fetch("VERSION")
-          arm_sha = ENV.fetch("ARM_SHA")
-          intel_sha = ENV.fetch("INTEL_SHA")
-          abort "invalid arm64 checksum" unless arm_sha.match?(/\A[0-9a-f]{64}\z/)
-          abort "invalid x86_64 checksum" unless intel_sha.match?(/\A[0-9a-f]{64}\z/)
-
-          source = File.read("Formula/ports.rb")
-          arm_url = "https://github.com/noahlin34/ports/releases/download/v#{version}/ports-macos-arm64.tar.gz"
-          intel_url = "https://github.com/noahlin34/ports/releases/download/v#{version}/ports-macos-x86_64.tar.gz"
-          source = source.sub(%r{https://github\.com/noahlin34/ports/releases/latest/download/ports-macos-arm64\.tar\.gz}, arm_url)
-          source = source.sub(%r{https://github\.com/noahlin34/ports/releases/latest/download/ports-macos-x86_64\.tar\.gz}, intel_url)
-          source = source.sub(/(^  homepage "[^\n]+"\n)/) { |match| "#{match}  version \"#{version}\"\n" }
-          source = source.sub(/(    url "#{Regexp.escape(arm_url)}"\n)/) { |match| "#{match}    sha256 \"#{arm_sha}\"\n" }
-          source = source.sub(/(    url "#{Regexp.escape(intel_url)}"\n)/) { |match| "#{match}    sha256 \"#{intel_sha}\"\n" }
-          abort "formula template did not contain both architecture URLs" unless source.include?("sha256 \"#{arm_sha}\"") && source.include?("sha256 \"#{intel_sha}\"")
-
-          Dir.mkdir("tap/Formula") unless Dir.exist?("tap/Formula")
-          File.write("tap/Formula/ports.rb", source)
-          RUBY
-
-          git -C tap config user.name "github-actions[bot]"
-          git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C tap add Formula/ports.rb
           if git -C tap diff --cached --quiet -- Formula/ports.rb; then
-            echo "Homebrew formula already points at ${version}"
+            echo "Tap formula is already current."
             exit 0
           fi
-          git -C tap commit -m "ports ${version}"
-          git -C tap remote set-head origin -a
-          tap_branch="$(git -C tap symbolic-ref --short refs/remotes/origin/HEAD | sed 's#^origin/##')"
-          git -C tap push origin "HEAD:${tap_branch}"
+          git -C tap diff --cached --check
+          git -C tap config user.name "github-actions[bot]"
+          git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C tap commit -m "Update ports to v${VERSION}"
+          git -C tap push origin HEAD:main

@@ -104,17 +104,30 @@ Ports releases target macOS on Apple silicon and Intel. Linux and Windows are no
 
 ## Releases and Homebrew tap updates
 
-Pushing a `vX.Y.Z` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml). The workflow builds the `aarch64-apple-darwin` and `x86_64-apple-darwin` targets, packages one executable per architecture, publishes both archives plus `checksums.txt` to the GitHub release, and renders the exact tag URLs and SHA-256 values into `Formula/ports.rb` in `noahlin34/homebrew-tap`.
+Every push and pull request runs the macOS CI workflow for formatting, Clippy,
+tests, and a release build. Pushing a `v<semver>` tag runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml). The release
+workflow builds the `aarch64-apple-darwin` and `x86_64-apple-darwin` targets,
+packages one executable per architecture, publishes both archives plus
+`checksums.txt` to the GitHub release, and renders the exact tag URLs and
+SHA-256 values into `Formula/ports.rb` in this repository and in
+`noahlin34/homebrew-tap`.
 
 The repository needs one user-provided Actions secret:
 
-- `HOMEBREW_TAP_TOKEN`: a GitHub fine-grained personal access token with **Contents: Read and write** permission for `noahlin34/homebrew-tap`.
+- `HOMEBREW_TAP_TOKEN`: a GitHub fine-grained personal access token with
+  **Contents: Read and write** permission for `noahlin34/homebrew-tap`.
 
-`GITHUB_TOKEN` is the repository-provided Actions token; it is used automatically for the GitHub release and must retain **Contents: Read and write** workflow permission. Add `HOMEBREW_TAP_TOKEN` under **Settings → Secrets and variables → Actions**, then push a tag such as:
+`GITHUB_TOKEN` is the repository-provided Actions token. It updates the source
+formula and publishes the GitHub release, so the workflow needs **Contents:
+Read and write** permission for the repository. Add `HOMEBREW_TAP_TOKEN` under
+**Settings → Secrets and variables → Actions**, then push a tag such as:
 
 ```sh
 git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-The tag must contain three numeric dot-separated components (`v1.2.3`). No manual checksum edits are needed: the tap formula is generated from the committed `Formula/ports.rb` architecture template after the release archives are built.
+The tag must contain a semantic version (`v1.2.3`, optionally with prerelease
+or build metadata). No manual checksum edits are needed: the source formula
+and tap formula are generated from the release archives after they are built.
