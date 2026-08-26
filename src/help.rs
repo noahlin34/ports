@@ -29,12 +29,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
         Line::from("")
     };
     let rows = vec![
-        key("Nav ↑↓/jk", "previous / next service", theme),
+        key("Nav ↑↓/jk", "previous / next row", theme),
+        key("Nav ←→/hl/v", "services · connections · all", theme),
         key("Nav PgUp/Dn", "move one page", theme),
-        key("Nav Home/End", "first / last service", theme),
+        key("Nav Home/End", "first / last row", theme),
         key("View Tab", "overview · connections · inspection", theme),
         key("Inspect Enter", "toggle selected detail", theme),
-        key("Inspect /", "search services (Esc cancels)", theme),
+        key("Inspect /", "search view (Esc cancels)", theme),
         key(
             "Inspect r/o/p",
             "refresh / open HTTP / full binary path",
@@ -73,7 +74,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
 /// their rectangles to be clipped before they index the backing buffer.
 pub(crate) fn modal_rect(area: Rect) -> Rect {
     let width = area.width.saturating_sub(8).clamp(54, 88).min(area.width);
-    let height = area.height.saturating_sub(4).clamp(18, 30).min(area.height);
+    let height = area.height.saturating_sub(2).clamp(18, 30).min(area.height);
     Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -130,7 +131,7 @@ mod tests {
             let expected_meaning_x = usize::from(modal.x + 1) + 13;
 
             for meaning in [
-                "previous / next service",
+                "previous / next row",
                 "select row + focus Overview",
                 "focus that panel",
                 "move one row (↑ / ↓)",
@@ -169,6 +170,7 @@ mod tests {
             .collect::<Vec<_>>();
         for text in [
             "Nav ↑↓/jk",
+            "Nav ←→/hl/v",
             "Inspect Enter",
             "Mouse",
             "Inspect c/u",
