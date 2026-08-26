@@ -114,4 +114,41 @@ impl Theme {
             .fg(self.danger)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     }
+
+    pub fn port(self) -> Style {
+        Style::default().fg(self.text).add_modifier(Modifier::BOLD)
+    }
+
+    pub fn mode_active(self) -> Style {
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn mode_inactive(self) -> Style {
+        Style::default().fg(self.muted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_style_is_bold_text() {
+        let theme = Theme::default();
+        let style = theme.port();
+        assert_eq!(style.fg, Some(theme.text));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn mode_styles_differentiate_active_and_inactive() {
+        let theme = Theme::default();
+        let active = theme.mode_active();
+        let inactive = theme.mode_inactive();
+        assert_eq!(active.fg, Some(theme.accent));
+        assert!(active.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(inactive.fg, Some(theme.muted));
+    }
 }
