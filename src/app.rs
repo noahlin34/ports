@@ -342,7 +342,7 @@ impl App {
                 self.next_refresh = Instant::now() + REFRESH_INTERVAL;
                 self.refresh_count = self.refresh_count.saturating_add(1);
                 self.error = None;
-                self.status = Some(format!("refreshed · {} services", self.services.len()));
+                self.status = None;
                 Ok(())
             }
             Err(error) => {
