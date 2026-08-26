@@ -430,11 +430,13 @@ fn render_inspection(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme)
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
-    let left = app
-        .status
-        .as_deref()
-        .or(app.error.as_deref())
-        .unwrap_or("ready · live discovery");
+    let (left, left_style) = if let Some(error) = &app.error {
+        (error.as_str(), theme.danger())
+    } else if let Some(status) = &app.status {
+        (status.as_str(), theme.muted())
+    } else {
+        ("ready · live discovery", theme.muted())
+    };
     let refreshed = app.last_refresh.map_or_else(
         || "never".to_owned(),
         |instant| {
@@ -447,14 +449,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         },
     );
     let line = Line::from(vec![
-        Span::styled(
-            left,
-            if app.error.is_some() {
-                theme.danger()
-            } else {
-                theme.muted()
-            },
-        ),
+        Span::styled(left, left_style),
         Span::raw("  "),
         Span::styled(format!("last refresh {refreshed}"), theme.muted()),
         Span::raw("                                      "),
@@ -466,6 +461,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         Span::raw(" focus  "),
         Span::styled("p", Style::default().fg(theme.accent)),
         Span::raw(" path  "),
+        Span::styled("x", Style::default().fg(theme.accent)),
+        Span::raw(" kill  "),
         Span::styled("?", Style::default().fg(theme.accent)),
         Span::raw(" help  "),
         Span::styled("q", Style::default().fg(theme.accent)),
@@ -516,25 +513,154 @@ fn render_confirmation(
     confirmation: &crate::app::Confirmation,
     theme: Theme,
 ) {
-    let modal = centered(area, 76, 8);
+    let modal_width = 72.min(area.width.saturating_sub(4)).max(20);
+    let modal_height = 11.min(area.height.saturating_sub(2)).max(6);
+    let modal = centered(area, modal_width, modal_height);
     frame.render_widget(Clear, modal);
-    let prompt = Text::from(vec![
-        Line::from(confirmation.prompt()),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Enter / y", theme.danger().add_modifier(Modifier::BOLD)),
-            Span::raw(" confirm    "),
-            Span::styled("Esc / n", Style::default().fg(theme.accent)),
-            Span::raw(" cancel"),
-        ]),
-    ]);
+
+    let (title, border_style) = if confirmation.is_blocked() {
+        ("Blocked action · Esc to dismiss", theme.danger())
+    } else {
+        match confirmation.kind {
+            crate::app::ConfirmKind::Terminate => ("Terminate process (SIGTERM)", theme.warning()),
+            crate::app::ConfirmKind::Kill => ("Force-kill process (SIGKILL)", theme.danger()),
+        }
+    };
+
+    let mut lines = Vec::new();
+
+    // Process & user line
+    let user = confirmation.process.user.as_deref().unwrap_or("—");
+    lines.push(Line::from(vec![
+        Span::styled("Target:  ", theme.muted()),
+        Span::styled(
+            format!(
+                "{} (PID {})",
+                confirmation.process.name, confirmation.process.pid
+            ),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled("User: ", theme.muted()),
+        Span::styled(
+            user,
+            if user == "root" {
+                theme.warning()
+            } else {
+                Style::default().fg(theme.text)
+            },
+        ),
+    ]));
+
+    // Command line or binary path if present
+    if let Some(command) = &confirmation.process.command {
+        lines.push(Line::from(vec![
+            Span::styled("Command: ", theme.muted()),
+            Span::styled(command.as_str(), theme.muted()),
+        ]));
+    } else if let Some(executable) = &confirmation.process.executable {
+        lines.push(Line::from(vec![
+            Span::styled("Binary:  ", theme.muted()),
+            Span::styled(executable.display().to_string(), theme.muted()),
+        ]));
+    }
+
+    // Sockets affected
+    let sockets_str = if confirmation.sockets.is_empty() {
+        confirmation.endpoint.clone()
+    } else {
+        confirmation.sockets.join(", ")
+    };
+    lines.push(Line::from(vec![
+        Span::styled("Sockets: ", theme.muted()),
+        Span::styled(sockets_str, Style::default().fg(theme.accent)),
+    ]));
+
+    // Notes or warnings
+    if let Some(reason) = &confirmation.blocked_reason {
+        lines.push(Line::from(vec![
+            Span::styled("Blocked: ", theme.danger().add_modifier(Modifier::BOLD)),
+            Span::styled(reason.as_str(), theme.danger()),
+        ]));
+    } else if confirmation.connection_count > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("Warning: ", theme.warning().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(
+                    "{} active peer connection(s) will be dropped.",
+                    confirmation.connection_count
+                ),
+                theme.warning(),
+            ),
+        ]));
+    } else if !confirmation.process.is_current_user && user == "root" {
+        lines.push(Line::from(vec![
+            Span::styled("Note: ", theme.warning().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Process is owned by root and may require elevated privileges.",
+                theme.warning(),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(""));
+    }
+
+    // Blank separator
+    lines.push(Line::from(""));
+
+    // Actions / prompt
+    if confirmation.is_blocked() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Esc / Enter",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" close"),
+        ]));
+    } else {
+        match confirmation.kind {
+            crate::app::ConfirmKind::Terminate => {
+                lines.push(Line::from(vec![
+                    Span::styled("Enter / y", theme.danger().add_modifier(Modifier::BOLD)),
+                    Span::raw(" terminate    "),
+                    Span::styled("Esc / n", Style::default().fg(theme.accent)),
+                    Span::raw(" cancel"),
+                ]));
+            }
+            crate::app::ConfirmKind::Kill => {
+                lines.push(Line::from(vec![
+                    Span::styled("Type KILL to confirm: ", theme.muted()),
+                    Span::styled(
+                        format!("[ {}▌ ]", confirmation.input),
+                        theme.danger().add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "Enter",
+                        if confirmation.input.trim() == "KILL" {
+                            theme.danger().add_modifier(Modifier::BOLD)
+                        } else {
+                            theme.muted()
+                        },
+                    ),
+                    Span::raw(" force-kill (when KILL is typed)    "),
+                    Span::styled("Esc", Style::default().fg(theme.accent)),
+                    Span::raw(" cancel"),
+                ]));
+            }
+        }
+    }
+
     frame.render_widget(
-        Paragraph::new(prompt)
+        Paragraph::new(Text::from(lines))
             .block(
                 Block::default()
-                    .title("Destructive action")
+                    .title(title)
                     .borders(Borders::ALL)
-                    .border_style(theme.danger())
+                    .border_style(border_style)
                     .style(theme.panel()),
             )
             .wrap(Wrap { trim: true }),
@@ -688,5 +814,78 @@ mod tests {
             "/Library/Apple/System/Library/PrivateFrameworks/Remote.framework/Support/r"
         ));
         assert!(rendered.contains("emoted"));
+    }
+
+    #[test]
+    fn confirmation_overlay_renders_terminate_and_kill_states() {
+        let mut process = ProcessMetadata::new(5432, "postgres");
+        process.command = Some("/usr/local/bin/postgres -D /data".into());
+        process.user = Some("postgres".into());
+        let service = ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 5432),
+            SocketState::Listening,
+            process,
+            None,
+        );
+
+        // Test Terminate overlay rendering
+        let mut app = App::from_services(vec![service.clone()]);
+        app.request_confirmation(crate::app::ConfirmKind::Terminate);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .flat_map(|cell| cell.symbol().chars())
+            .collect::<String>();
+        assert!(rendered.contains("Terminate process (SIGTERM)"));
+        assert!(rendered.contains("postgres (PID 5432)"));
+        assert!(rendered.contains("User: postgres"));
+        assert!(rendered.contains("Command: /usr/local/bin/postgres"));
+        assert!(rendered.contains("Enter / y"));
+        assert!(rendered.contains("terminate"));
+
+        // Test Force-Kill overlay rendering
+        let mut app_kill = App::from_services(vec![service]);
+        app_kill.request_confirmation(crate::app::ConfirmKind::Kill);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app_kill)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .flat_map(|cell| cell.symbol().chars())
+            .collect::<String>();
+        assert!(rendered.contains("Force-kill process (SIGKILL)"));
+        assert!(rendered.contains("Type KILL to confirm"));
+
+        // Test Blocked system process overlay rendering
+        let root_service = ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 80),
+            SocketState::Listening,
+            ProcessMetadata::new(1, "launchd"),
+            None,
+        );
+        let mut app_blocked = App::from_services(vec![root_service]);
+        app_blocked.request_confirmation(crate::app::ConfirmKind::Terminate);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app_blocked)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .flat_map(|cell| cell.symbol().chars())
+            .collect::<String>();
+        assert!(rendered.contains("Blocked"));
+        assert!(rendered.contains("launchd (PID 1)"));
     }
 }
