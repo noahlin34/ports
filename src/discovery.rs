@@ -163,32 +163,35 @@ pub fn parse_lsof(input: &[u8]) -> Vec<SocketRecord> {
 
 /// Group parsed sockets into deterministic service rows.
 ///
-/// A peer-bearing socket is attached to the best listener owned by the same
-/// process (exact local address wins over an address-family wildcard).  When no
-/// listener is visible, the socket remains as a standalone service row with its
-/// connection retained, so permission-filtered listener records do not erase
-/// useful activity.
+/// Listening sockets owned by one process and sharing a protocol/port are
+/// represented by one service, even when the kernel reports separate IPv4 and
+/// IPv6 bindings. Every binding is retained, while the primary `local`
+/// endpoint remains deterministic. Non-listening records retain their
+/// address/state grouping so unrelated socket rows are not merged. A
+/// peer-bearing socket is attached to the best listener owned by the same
+/// process (exact local address wins over an address-family wildcard). When no
+/// listener is visible, the socket remains a standalone service row with its
+/// connection retained.
 pub fn services_from_sockets(mut sockets: Vec<SocketRecord>) -> Vec<ServiceRecord> {
     sockets.sort();
     sockets.dedup();
 
     let mut services = Vec::new();
     for socket in sockets.iter().filter(|socket| socket.remote.is_none()) {
-        if services.iter().any(|service: &ServiceRecord| {
-            service.protocol == socket.protocol
-                && service.local == socket.local
-                && service.state == socket.state
-                && service.process.pid == socket.process.pid
-        }) {
-            continue;
+        let matching = services
+            .iter()
+            .position(|service: &ServiceRecord| service_group_matches(service, socket));
+        if let Some(index) = matching {
+            services[index].add_binding(socket.local.clone());
+        } else {
+            services.push(ServiceRecord::new(
+                socket.protocol,
+                socket.local.clone(),
+                socket.state.clone(),
+                socket.process.clone(),
+                None,
+            ));
         }
-        services.push(ServiceRecord::new(
-            socket.protocol,
-            socket.local.clone(),
-            socket.state.clone(),
-            socket.process.clone(),
-            None,
-        ));
     }
 
     let connections = sockets
@@ -400,22 +403,43 @@ fn parse_endpoint(value: &str, family: AddressFamily) -> Option<Endpoint> {
     Some(Endpoint::new(address, port))
 }
 
+fn service_group_matches(service: &ServiceRecord, socket: &SocketRecord) -> bool {
+    if service.protocol != socket.protocol
+        || service.process.pid != socket.process.pid
+        || service.local.port != socket.local.port
+    {
+        return false;
+    }
+    if service.state.is_listening() && socket.state.is_listening() {
+        return true;
+    }
+    service.local == socket.local && service.state == socket.state
+}
+
 fn listener_match_score(service: &ServiceRecord, connection: &ConnectionRecord) -> Option<u8> {
-    if service.protocol != connection.protocol
+    if !service.state.is_listening()
+        || service.protocol != connection.protocol
         || service.process.pid != connection.process.pid
         || service.local.port != connection.local.port
     {
         return None;
     }
-    if service.local.address == connection.local.address {
-        return Some(2);
-    }
-    if service.local.address.is_unspecified()
-        && service.local.address.is_ipv4() == connection.local.address.is_ipv4()
-    {
-        return Some(1);
-    }
-    None
+
+    service
+        .bindings
+        .iter()
+        .filter_map(|binding| {
+            if binding.address == connection.local.address {
+                Some(2)
+            } else if binding.address.is_unspecified()
+                && binding.address.is_ipv4() == connection.local.address.is_ipv4()
+            {
+                Some(1)
+            } else {
+                None
+            }
+        })
+        .max()
 }
 
 fn enrich_processes(sockets: &mut [SocketRecord]) {
