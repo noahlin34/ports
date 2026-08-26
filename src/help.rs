@@ -36,6 +36,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
         Line::from(""),
         Line::from(vec![Span::styled("Inspect", theme.title())]),
         key("Enter", "toggle the selected detail view", theme),
+        key("p", "show the full binary path", theme),
         key("/", "search services (Esc cancels)", theme),
         key("r", "refresh discovery now", theme),
         key("c", "copy the raw bind endpoint", theme),
