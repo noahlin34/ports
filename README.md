@@ -62,23 +62,41 @@ ports inspect 8080 --json
 
 `kill <port>` terminates the process listening on a port after confirmation. Use `ports --help` for command-specific options. Read commands share these filters: `--protocol`, `--state`, `--scope`, `--process`, `--pid`, `--user`, and `--all`. `--json` is supported by read commands for machine-readable output.
 
-## TUI keybindings
+## TUI interaction
+
+Keyboard bindings remain available with mouse support:
 
 | Key | Action |
 | --- | --- |
 | Arrow keys / `j` `k` | Navigate |
-| `/` | Search |
+| `Page Up` / `Page Down` | Move one page |
+| `Home` / `End` | First / last service |
 | `Tab` | Switch view/detail focus |
-| `Enter` | Inspect the selected item |
+| `Enter` | Toggle the selected detail view |
+| `/` | Search services |
 | `p` | Show the full executable path |
-| `r` | Refresh |
-| `c` | Copy address |
-| `u` | Copy URL |
-| `o` | Open service |
-| `x` | Terminate with confirmation |
-| `X` | Force-kill with stronger confirmation |
+| `r` | Refresh discovery |
+| `c` | Copy the raw bind endpoint |
+| `u` | Copy a conservative local HTTP URL |
+| `o` | Open a likely HTTP service |
+| `x` | Terminate with SIGTERM confirmation |
+| `X` | Force-kill with SIGKILL; type `KILL` to confirm |
 | `?` | Show help |
+| `Esc` | Close help or the active overlay |
 | `q` | Quit |
+
+### Mouse
+
+| Mouse | Action |
+| --- | --- |
+| Move pointer | Highlight rows, panels, and actions |
+| Single-click a row | Select the row and focus Overview |
+| Single-click a panel | Focus that panel |
+| Wheel up/down over Overview | Move selection one row (same as Arrow up/down) |
+| Single-click a visible action | Trigger its keyboard equivalent |
+| Overlay open | Modal controls; outside clicks no-op |
+
+When shown, footer actions (`/ search`, `Tab focus`, `p path`, `x kill`, `? help`, and `q quit`) and modal controls (`Enter` to apply, `Esc` to cancel or close, and confirmation buttons) can be clicked. Destructive actions keep their safety gates: termination requires confirmation, and force-kill requires typing `KILL`. Single-click only; double-click and drag do nothing.
 
 ## Platform and privileges
 
