@@ -88,3 +88,44 @@ fn correlates_wildcard_listener_and_keeps_standalone_active_socket() {
         "2001:db8::2".parse::<IpAddr>().unwrap()
     );
 }
+
+#[test]
+fn collapses_dual_stack_listeners_retains_bindings_and_attaches_peer() {
+    let fixture = b"p42\ncserver\nu501\nLalice\nf3u\ntIPv4\nPTCP\nn*:8080\nTST=LISTEN\nf4u\ntIPv6\nPTCP\nn[2001:db8::10]:8080\nTST=LISTEN\nf5u\ntIPv6\nPTCP\nn[2001:db8::10]:8080->[2001:db8::20]:443\nTST=ESTABLISHED\n";
+    let services = services_from_sockets(parse_lsof(fixture));
+
+    assert_eq!(services.len(), 1);
+    let service = &services[0];
+    assert_eq!(service.local.address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    assert_eq!(service.bindings.len(), 2);
+    assert!(service.bindings.contains(&ports::model::Endpoint::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        8080
+    )));
+    assert!(service.bindings.contains(&ports::model::Endpoint::new(
+        IpAddr::V6("2001:db8::10".parse().unwrap()),
+        8080
+    )));
+    assert_eq!(service.scope, ports::model::NetworkScope::AllInterfaces);
+    assert_eq!(service.connections.len(), 1);
+    assert_eq!(
+        service.connections[0].local.address,
+        "2001:db8::10".parse::<IpAddr>().unwrap()
+    );
+}
+
+#[test]
+fn keeps_same_port_listeners_owned_by_distinct_processes_separate() {
+    let fixture = b"p42\ncfirst\nf3u\ntIPv4\nPTCP\nn*:8080\nTST=LISTEN\np77\ncsecond\nf4u\ntIPv6\nPTCP\nn[::]:8080\nTST=LISTEN\n";
+    let services = services_from_sockets(parse_lsof(fixture));
+
+    assert_eq!(services.len(), 2);
+    assert_eq!(
+        services
+            .iter()
+            .map(|service| service.process.pid)
+            .collect::<Vec<_>>(),
+        vec![42, 77]
+    );
+    assert!(services.iter().all(|service| service.bindings.len() == 1));
+}
