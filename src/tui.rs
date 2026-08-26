@@ -1203,97 +1203,194 @@ fn render_details(
         return;
     };
 
-    if let Some(connection) = connection {
-        let remote = connection.remote.to_string();
-        let local = connection.local.to_string();
-        let protocol = connection.protocol.to_string();
-        let state = connection.state.to_string();
-        let process = if connection.process.name.is_empty() {
-            "—".to_owned()
-        } else {
-            connection.process.name.clone()
-        };
-        let pid = connection.process.pid.to_string();
-        let scope = connection.scope.description();
-        let lines = vec![
-            detail_line("remote", &remote, theme.exposure(connection.scope)),
-            detail_line("state", &state, theme.good()),
-            detail_line("local", &local, theme.exposure(connection.scope)),
-            detail_line("protocol", &protocol, Style::default().fg(theme.text)),
-            detail_line("process", &process, Style::default().fg(theme.text)),
-            detail_line("pid", &pid, Style::default().fg(theme.text)),
-            detail_line("scope", scope, theme.exposure(connection.scope)),
-        ];
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(block)
-                .wrap(Wrap { trim: true }),
-            area,
-        );
-        return;
-    }
+    let (process, fallback_service_process) = if let Some(connection) = connection {
+        (&connection.process, Some(&service.process))
+    } else {
+        (&service.process, None)
+    };
 
-    let bindings = if service.bindings.is_empty() {
-        service.local.to_string()
+    let process_name = if !process.name.is_empty() {
+        process.name.as_str()
+    } else if let Some(sp) = fallback_service_process {
+        sp.name.as_str()
     } else {
-        service
-            .bindings
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
+        ""
     };
-    let state = service.state.to_string();
-    let process = if service.process.name.is_empty() {
-        "—".to_owned()
+
+    let pid = if process.pid > 0 {
+        process.pid
+    } else if let Some(sp) = fallback_service_process {
+        sp.pid
     } else {
-        service.process.name.clone()
+        0
     };
-    let pid = service.process.pid.to_string();
-    let user = service.process.user.as_deref().unwrap_or("—");
+    let pid_str = pid.to_string();
+
+    let user = process
+        .user
+        .as_deref()
+        .or_else(|| {
+            fallback_service_process.and_then(|sp| {
+                if sp.pid == pid || pid == 0 {
+                    sp.user.as_deref()
+                } else {
+                    None
+                }
+            })
+        })
+        .filter(|u| !u.trim().is_empty() && *u != "—");
+
     let project = service
         .service
         .as_deref()
         .or_else(|| {
-            service
-                .process
+            process
                 .cwd
                 .as_deref()
+                .or_else(|| {
+                    fallback_service_process.and_then(|sp| {
+                        if sp.pid == pid || pid == 0 {
+                            sp.cwd.as_deref()
+                        } else {
+                            None
+                        }
+                    })
+                })
                 .and_then(|cwd| cwd.file_name().and_then(|name| name.to_str()))
         })
-        .unwrap_or("—");
-    let cwd = service
-        .process
-        .cwd
-        .as_deref()
-        .map_or_else(|| "—".to_owned(), |path| path.display().to_string());
-    let executable = service
-        .process
-        .executable
-        .as_deref()
-        .map_or_else(|| "—".to_owned(), |path| path.display().to_string());
+        .filter(|p| !p.trim().is_empty() && *p != "—");
 
-    let mut lines = vec![
-        detail_line("bindings", &bindings, theme.exposure(service.scope)),
-        detail_line(
-            "scope",
-            service.scope.description(),
-            theme.exposure(service.scope),
-        ),
-        detail_line("state", &state, theme.good()),
-        detail_line("process", &process, Style::default().fg(theme.text)),
-        detail_line("pid", &pid, Style::default().fg(theme.text)),
-        detail_line("user", user, Style::default().fg(theme.text)),
-        detail_line("project", project, theme.muted()),
-        detail_line("cwd", &cwd, theme.muted()),
-        detail_line("binary", &executable, theme.muted()),
-    ];
+    let cwd_path = process.cwd.as_deref().or_else(|| {
+        fallback_service_process.and_then(|sp| {
+            if sp.pid == pid || pid == 0 {
+                sp.cwd.as_deref()
+            } else {
+                None
+            }
+        })
+    });
+    let cwd_display = cwd_path.map(|path| path.display().to_string());
+    let cwd = cwd_display
+        .as_deref()
+        .filter(|s| !s.trim().is_empty() && *s != "—");
 
-    if let Some(cmd) = useful_command(
-        service.process.command.as_deref(),
-        service.process.executable.as_deref(),
-        &service.process.name,
-    ) {
+    let exe_path = process.executable.as_deref().or_else(|| {
+        fallback_service_process.and_then(|sp| {
+            if sp.pid == pid || pid == 0 {
+                sp.executable.as_deref()
+            } else {
+                None
+            }
+        })
+    });
+    let exe_display = exe_path.map(|path| path.display().to_string());
+    let executable = exe_display
+        .as_deref()
+        .filter(|s| !s.trim().is_empty() && *s != "—");
+
+    let command_str = process.command.as_deref().or_else(|| {
+        fallback_service_process.and_then(|sp| {
+            if sp.pid == pid || pid == 0 {
+                sp.command.as_deref()
+            } else {
+                None
+            }
+        })
+    });
+    let cmd = useful_command(command_str, exe_path, process_name);
+
+    let remote = connection.map(|c| c.remote.to_string());
+    let local = connection.map(|c| c.local.to_string());
+    let protocol = connection.map(|c| c.protocol.to_string());
+    let conn_state = connection.map(|c| c.state.to_string());
+
+    let bindings = if connection.is_none() {
+        Some(if service.bindings.is_empty() {
+            service.local.to_string()
+        } else {
+            service
+                .bindings
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+    } else {
+        None
+    };
+    let svc_state = if connection.is_none() {
+        Some(service.state.to_string())
+    } else {
+        None
+    };
+
+    let mut lines = if let Some(connection) = connection {
+        vec![
+            detail_line(
+                "remote",
+                remote.as_deref().unwrap_or(""),
+                theme.exposure(connection.scope),
+            ),
+            detail_line(
+                "local",
+                local.as_deref().unwrap_or(""),
+                theme.exposure(connection.scope),
+            ),
+            detail_line(
+                "protocol",
+                protocol.as_deref().unwrap_or(""),
+                Style::default().fg(theme.text),
+            ),
+            detail_line("state", conn_state.as_deref().unwrap_or(""), theme.good()),
+            detail_line(
+                "scope",
+                connection.scope.description(),
+                theme.exposure(connection.scope),
+            ),
+        ]
+    } else {
+        vec![
+            detail_line(
+                "bindings",
+                bindings.as_deref().unwrap_or(""),
+                theme.exposure(service.scope),
+            ),
+            detail_line(
+                "scope",
+                service.scope.description(),
+                theme.exposure(service.scope),
+            ),
+            detail_line("state", svc_state.as_deref().unwrap_or(""), theme.good()),
+        ]
+    };
+
+    if !process_name.is_empty() {
+        lines.push(detail_line(
+            "process",
+            process_name,
+            Style::default().fg(theme.text),
+        ));
+    }
+    if pid > 0 {
+        lines.push(detail_line(
+            "pid",
+            &pid_str,
+            Style::default().fg(theme.text),
+        ));
+    }
+    if let Some(user) = user {
+        lines.push(detail_line("user", user, Style::default().fg(theme.text)));
+    }
+    if let Some(project) = project {
+        lines.push(detail_line("project", project, theme.muted()));
+    }
+    if let Some(cwd) = cwd {
+        lines.push(detail_line("cwd", cwd, theme.muted()));
+    }
+    if let Some(executable) = executable {
+        lines.push(detail_line("binary", executable, theme.muted()));
+    }
+    if let Some(cmd) = cmd {
         lines.push(detail_line("command", cmd, theme.muted()));
     }
 
@@ -1378,11 +1475,11 @@ fn render_connections(
         Table::new(
             rows,
             [
-                Constraint::Length(4),
-                Constraint::Min(22),
-                Constraint::Length(15),
-                Constraint::Length(13),
-                Constraint::Length(8),
+                Constraint::Length(3),
+                Constraint::Fill(1),
+                Constraint::Length(11),
+                Constraint::Length(7),
+                Constraint::Length(5),
             ],
         )
         .header(Row::new(vec!["", "PEER", "STATE", "SCOPE", "PID"]).style(theme.muted()))
@@ -1924,6 +2021,29 @@ mod tests {
     }
 
     #[test]
+    fn connections_panel_renders_established_state_without_truncation() {
+        let mut service = make_test_service(79045, "bun", 56762);
+        service.add_connection(make_test_connection(56762, (155, 443)));
+        let app = App::from_services(vec![service]);
+
+        for (width, height) in [(112, 28), (120, 30), (140, 32), (160, 36), (200, 40)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let rendered = rendered_buffer(&terminal);
+
+            assert!(
+                rendered.contains("ESTABLISHED"),
+                "Expected ESTABLISHED to be fully visible at width {width}"
+            );
+            assert!(
+                !rendered.contains("ESTABLISHE "),
+                "Found truncated ESTABLISHE at width {width}"
+            );
+        }
+    }
+
+    #[test]
     fn narrow_and_wide_surfaces_render_without_panicking() {
         for (width, height) in [(80, 24), (140, 32), (40, 12)] {
             let backend = TestBackend::new(width, height);
@@ -2021,6 +2141,121 @@ mod tests {
             .iter()
             .flat_map(|cell| cell.symbol().chars())
             .collect::<String>();
+        assert!(!rendered.contains("command"));
+    }
+
+    #[test]
+    fn connection_details_show_rich_process_and_workspace_metadata() {
+        let mut process = ProcessMetadata::new(5123, "api-server");
+        process.user = Some("developer".into());
+        process.cwd = Some(PathBuf::from("/Users/developer/projects/api"));
+        process.executable = Some(PathBuf::from("/opt/homebrew/bin/api-server"));
+        process.command = Some("/opt/homebrew/bin/api-server --port 8080".into());
+
+        let mut service = ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8080),
+            SocketState::Listening,
+            process.clone(),
+            Some("api".into()),
+        );
+        let connection = ConnectionRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8080),
+            Endpoint::new(IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 55)), 54321),
+            SocketState::Established,
+            process,
+        );
+        service.add_connection(connection);
+
+        let mut app = App::from_services(vec![service]);
+        app.set_view_mode(ViewMode::Connections);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let selected_row = app.selected_row();
+                render_details(
+                    frame,
+                    frame.area(),
+                    selected_row.map(|row| row.service()),
+                    selected_row.and_then(|row| row.connection()),
+                    false,
+                    &HoverState::default(),
+                    Theme::default(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_buffer(&terminal);
+        assert!(rendered.contains("Selected connection"));
+        assert!(rendered.contains("remote"));
+        assert!(rendered.contains("192.0.2.55:54321"));
+        assert!(rendered.contains("local"));
+        assert!(rendered.contains("127.0.0.1:8080"));
+        assert!(rendered.contains("protocol"));
+        assert!(rendered.contains("TCP"));
+        assert!(rendered.contains("state"));
+        assert!(rendered.contains("ESTABLISHED"));
+        assert!(rendered.contains("scope"));
+        assert!(rendered.contains("process"));
+        assert!(rendered.contains("api-server"));
+        assert!(rendered.contains("pid"));
+        assert!(rendered.contains("5123"));
+        assert!(rendered.contains("user"));
+        assert!(rendered.contains("developer"));
+        assert!(rendered.contains("project"));
+        assert!(rendered.contains("api"));
+        assert!(rendered.contains("cwd"));
+        assert!(rendered.contains("/Users/developer/projects/api"));
+        assert!(rendered.contains("binary"));
+        assert!(rendered.contains("/opt/homebrew/bin/api-server"));
+        assert!(rendered.contains("command"));
+        assert!(rendered.contains("--port 8080"));
+    }
+
+    #[test]
+    fn details_omits_missing_or_blank_fields() {
+        let process = ProcessMetadata::new(1234, "minimal");
+        let service = ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9000),
+            SocketState::Listening,
+            process,
+            None,
+        );
+
+        let app = App::from_services(vec![service]);
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    app.selected_service(),
+                    None,
+                    false,
+                    &HoverState::default(),
+                    Theme::default(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_buffer(&terminal);
+        assert!(rendered.contains("Selected service"));
+        assert!(rendered.contains("bindings"));
+        assert!(rendered.contains("127.0.0.1:9000"));
+        assert!(rendered.contains("process"));
+        assert!(rendered.contains("minimal"));
+        assert!(rendered.contains("pid"));
+        assert!(rendered.contains("1234"));
+        // Missing fields must not have dummy labels or placeholder dashes
+        assert!(!rendered.contains("user"));
+        assert!(!rendered.contains("project"));
+        assert!(!rendered.contains("cwd"));
+        assert!(!rendered.contains("binary"));
         assert!(!rendered.contains("command"));
     }
 
