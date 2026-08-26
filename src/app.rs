@@ -15,10 +15,12 @@ use ports::{
 const HISTORY_LIMIT: usize = 128;
 pub const REFRESH_INTERVAL: Duration = Duration::from_millis(900);
 
+/// Stable identity for a grouped service row. Binding addresses are
+/// intentionally absent so refreshes and dual-stack collapse do not move the
+/// selection.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ServiceKey {
     pub protocol: Protocol,
-    pub address: std::net::IpAddr,
     pub port: u16,
     pub pid: u32,
 }
@@ -27,9 +29,95 @@ impl ServiceKey {
     pub fn from_service(service: &ServiceRecord) -> Self {
         Self {
             protocol: service.protocol,
-            address: service.local.address,
             port: service.local.port,
             pid: service.process.pid,
+        }
+    }
+}
+
+/// The primary data set shown in the table. This is intentionally separate
+/// from [`Focus`], which controls the secondary detail panels.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ViewMode {
+    #[default]
+    Services,
+    Connections,
+    All,
+}
+
+impl ViewMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Services => "Services",
+            Self::Connections => "Connections",
+            Self::All => "All",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Services => Self::Connections,
+            Self::Connections => Self::All,
+            Self::All => Self::Services,
+        }
+    }
+
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Services => Self::All,
+            Self::Connections => Self::Services,
+            Self::All => Self::Connections,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ConnectionKey {
+    protocol: Protocol,
+    local_port: u16,
+    remote: ports::model::RemoteEndpoint,
+    pid: u32,
+}
+
+impl ConnectionKey {
+    fn from_connection(connection: &ports::model::ConnectionRecord) -> Self {
+        Self {
+            protocol: connection.protocol,
+            local_port: connection.local.port,
+            remote: connection.remote.clone(),
+            pid: connection.process.pid,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum RowKey {
+    Service(ServiceKey),
+    Connection(ConnectionKey),
+}
+
+/// A row in the primary table. Connections retain their owning service so
+/// details and process actions continue to work for listener-attached peers.
+#[derive(Clone, Copy, Debug)]
+pub enum ViewRow<'a> {
+    Service(&'a ServiceRecord),
+    Connection {
+        service: &'a ServiceRecord,
+        connection: &'a ports::model::ConnectionRecord,
+    },
+}
+
+impl<'a> ViewRow<'a> {
+    pub fn service(self) -> &'a ServiceRecord {
+        match self {
+            Self::Service(service) | Self::Connection { service, .. } => service,
+        }
+    }
+
+    pub fn connection(self) -> Option<&'a ports::model::ConnectionRecord> {
+        match self {
+            Self::Service(_) => None,
+            Self::Connection { connection, .. } => Some(connection),
         }
     }
 }
@@ -140,9 +228,14 @@ pub enum Overlay {
 /// invalidating a selected socket or leaving stale modal state behind.
 pub struct App {
     pub services: Vec<ServiceRecord>,
+    /// Legacy service indexes retained for consumers that only render service
+    /// rows. New renderers should use [`Self::visible_rows`].
     pub visible: Vec<usize>,
+    view_rows: Vec<RowIndex>,
     pub selected: usize,
     pub selected_key: Option<ServiceKey>,
+    selected_row_key: Option<RowKey>,
+    pub view_mode: ViewMode,
     pub focus: Focus,
     pub overlay: Overlay,
     pub search_query: String,
@@ -156,13 +249,25 @@ pub struct App {
     pub should_quit: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RowIndex {
+    Service(usize),
+    Connection {
+        service_index: usize,
+        connection_index: usize,
+    },
+}
+
 impl Default for App {
     fn default() -> Self {
         Self {
             services: Vec::new(),
             visible: Vec::new(),
+            view_rows: Vec::new(),
             selected: 0,
             selected_key: None,
+            selected_row_key: None,
+            view_mode: ViewMode::Services,
             focus: Focus::Overview,
             overlay: Overlay::None,
             search_query: String::new(),
@@ -188,6 +293,7 @@ fn sort_services(services: &mut [ServiceRecord]) {
             .then_with(|| left.protocol.cmp(&right.protocol))
             .then_with(|| left.local.cmp(&right.local))
             .then_with(|| left.process.pid.cmp(&right.process.pid))
+            .then_with(|| left.process.name.cmp(&right.process.name))
     });
 }
 
@@ -305,13 +411,64 @@ impl App {
     }
 
     pub fn selected_service(&self) -> Option<&ServiceRecord> {
-        self.visible
-            .get(self.selected)
-            .and_then(|index| self.services.get(*index))
+        self.selected_row().map(ViewRow::service)
     }
 
     pub fn selected_service_key(&self) -> Option<ServiceKey> {
         self.selected_service().map(ServiceKey::from_service)
+    }
+
+    pub fn selected_row(&self) -> Option<ViewRow<'_>> {
+        self.visible_rows().nth(self.selected)
+    }
+
+    pub fn current_view(&self) -> ViewMode {
+        self.view_mode
+    }
+
+    pub fn current_view_label(&self) -> &'static str {
+        self.view_mode.label()
+    }
+
+    pub fn visible_count(&self) -> usize {
+        self.view_rows.len()
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.visible_count()
+    }
+
+    pub fn visible_rows(&self) -> impl Iterator<Item = ViewRow<'_>> + '_ {
+        self.view_rows.iter().filter_map(|row| match *row {
+            RowIndex::Service(index) => self.services.get(index).map(ViewRow::Service),
+            RowIndex::Connection {
+                service_index,
+                connection_index,
+            } => self.services.get(service_index).and_then(|service| {
+                service
+                    .connections
+                    .get(connection_index)
+                    .map(|connection| ViewRow::Connection {
+                        service,
+                        connection,
+                    })
+            }),
+        })
+    }
+
+    pub fn next_view(&mut self) {
+        self.set_view_mode(self.view_mode.next());
+    }
+
+    pub fn previous_view(&mut self) {
+        self.set_view_mode(self.view_mode.previous());
+    }
+
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        if self.view_mode != mode {
+            self.view_mode = mode;
+            self.recompute_visible();
+        }
     }
 
     pub fn push_history(&mut self, kind: HistoryKind, detail: String) {
@@ -323,43 +480,97 @@ impl App {
 
     pub fn recompute_visible(&mut self) {
         let selected_key = self
-            .selected_key
+            .selected_row_key
             .clone()
-            .or_else(|| self.selected_service_key());
+            .or_else(|| self.selected_key.clone().map(RowKey::Service))
+            .or_else(|| self.selected_row().and_then(|row| self.row_key(row)));
         let filter = if self.search_query.trim().is_empty() {
             Filter::default()
         } else {
             Filter::search(self.search_query.clone())
         };
-        self.visible = self
-            .services
-            .iter()
-            .enumerate()
-            .filter_map(|(index, service)| filter.matches(service).then_some(index))
-            .collect();
+
+        self.view_rows.clear();
+        self.visible.clear();
+        for (service_index, service) in self.services.iter().enumerate() {
+            let service_matches = filter.matches(service);
+            let include_service = service_matches
+                && (self.view_mode == ViewMode::All
+                    || (self.view_mode == ViewMode::Services && service.state.is_listening()));
+            if include_service {
+                self.view_rows.push(RowIndex::Service(service_index));
+                self.visible.push(service_index);
+            }
+
+            if matches!(self.view_mode, ViewMode::Connections | ViewMode::All) {
+                for (connection_index, connection) in service.connections.iter().enumerate() {
+                    if connection.is_active() && filter.matches_connection(connection) {
+                        self.view_rows.push(RowIndex::Connection {
+                            service_index,
+                            connection_index,
+                        });
+                    }
+                }
+            }
+        }
+
         self.selected = selected_key
             .as_ref()
             .and_then(|key| {
-                self.visible.iter().position(|index| {
-                    self.services
-                        .get(*index)
-                        .is_some_and(|service| ServiceKey::from_service(service) == *key)
+                self.view_rows.iter().position(|row| {
+                    self.row_key_from_index(*row)
+                        .is_some_and(|candidate| candidate == *key)
                 })
             })
-            .unwrap_or_else(|| self.selected.min(self.visible.len().saturating_sub(1)));
+            .unwrap_or_else(|| self.selected.min(self.row_count().saturating_sub(1)));
+        self.sync_selection_keys();
+    }
+
+    fn row_key(&self, row: ViewRow<'_>) -> Option<RowKey> {
+        match row {
+            ViewRow::Service(service) => Some(RowKey::Service(ServiceKey::from_service(service))),
+            ViewRow::Connection { connection, .. } => Some(RowKey::Connection(
+                ConnectionKey::from_connection(connection),
+            )),
+        }
+    }
+
+    fn row_key_from_index(&self, row: RowIndex) -> Option<RowKey> {
+        match row {
+            RowIndex::Service(index) => self
+                .services
+                .get(index)
+                .map(|service| RowKey::Service(ServiceKey::from_service(service))),
+            RowIndex::Connection {
+                service_index,
+                connection_index,
+            } => self
+                .services
+                .get(service_index)
+                .and_then(|service| service.connections.get(connection_index))
+                .map(|connection| RowKey::Connection(ConnectionKey::from_connection(connection))),
+        }
+    }
+
+    fn sync_selection_keys(&mut self) {
+        self.selected_row_key = self
+            .view_rows
+            .get(self.selected)
+            .and_then(|row| self.row_key_from_index(*row));
         self.selected_key = self.selected_service_key();
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        if self.visible.is_empty() {
+        if self.view_rows.is_empty() {
             self.selected = 0;
             self.selected_key = None;
+            self.selected_row_key = None;
             return;
         }
-        let max = self.visible.len() - 1;
+        let max = self.view_rows.len() - 1;
         let target = (self.selected as isize + delta).clamp(0, max as isize) as usize;
         self.selected = target;
-        self.selected_key = self.selected_service_key();
+        self.sync_selection_keys();
     }
 
     /// Select a row by its position in the currently visible, filtered list.
@@ -369,14 +580,15 @@ impl App {
     /// the last visible row. Empty lists reset to the same neutral state used
     /// by keyboard selection movement.
     pub(crate) fn select_visible_index(&mut self, index: usize) {
-        if self.visible.is_empty() {
+        if self.view_rows.is_empty() {
             self.selected = 0;
             self.selected_key = None;
+            self.selected_row_key = None;
             return;
         }
 
-        self.selected = index.min(self.visible.len() - 1);
-        self.selected_key = self.selected_service_key();
+        self.selected = index.min(self.view_rows.len() - 1);
+        self.sync_selection_keys();
     }
 
     /// Move selection using the same clamping semantics as keyboard movement.
@@ -386,12 +598,12 @@ impl App {
 
     pub fn select_home(&mut self) {
         self.selected = 0;
-        self.selected_key = self.selected_service_key();
+        self.sync_selection_keys();
     }
 
     pub fn select_end(&mut self) {
-        self.selected = self.visible.len().saturating_sub(1);
-        self.selected_key = self.selected_service_key();
+        self.selected = self.view_rows.len().saturating_sub(1);
+        self.sync_selection_keys();
     }
 
     pub fn begin_search(&mut self) {
@@ -437,7 +649,11 @@ impl App {
                 .services
                 .iter()
                 .filter(|s| s.process.pid == pid)
-                .map(|s| format!("{} {}", s.protocol, s.local))
+                .flat_map(|s| {
+                    s.bindings
+                        .iter()
+                        .map(move |binding| format!("{} {}", s.protocol, binding))
+                })
                 .collect();
             sockets.sort();
             sockets.dedup();
@@ -621,6 +837,8 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.overlay = Overlay::Help,
             KeyCode::Char('/') => self.begin_search(),
+            KeyCode::Left | KeyCode::Char('h') => self.previous_view(),
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('v') => self.next_view(),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp => self.move_selection(-10),
@@ -737,7 +955,7 @@ fn is_likely_http(service: &ServiceRecord) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ports::model::{Endpoint, ProcessMetadata, SocketState};
+    use ports::model::{ConnectionRecord, Endpoint, ProcessMetadata, SocketState};
     use std::{
         net::{IpAddr, Ipv4Addr},
         path::PathBuf,
@@ -753,6 +971,113 @@ mod tests {
         )
     }
 
+    fn connection(local_port: u16, pid: u32, remote_port: u16) -> ConnectionRecord {
+        ConnectionRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port),
+            Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), remote_port),
+            SocketState::Established,
+            ProcessMetadata::new(pid, format!("proc-{pid}")),
+        )
+    }
+
+    #[test]
+    fn services_is_the_default_view_and_views_cycle_deterministically() {
+        let mut app = App::default();
+        assert_eq!(app.view_mode, ViewMode::Services);
+        assert_eq!(app.current_view_label(), "Services");
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.view_mode, ViewMode::Connections);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.view_mode, ViewMode::All);
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.view_mode, ViewMode::Connections);
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.view_mode, ViewMode::All);
+    }
+
+    #[test]
+    fn views_classify_services_and_active_connections() {
+        let mut listener = service(8080, 7, SocketState::Listening);
+        listener.add_connection(connection(8080, 7, 51000));
+        let mut standalone = service(9090, 8, SocketState::Established);
+        standalone.add_connection(connection(9090, 8, 52000));
+        let app = App::from_services(vec![listener, standalone]);
+
+        assert_eq!(app.visible_count(), 1);
+        assert!(app
+            .visible_rows()
+            .all(|row| matches!(row, ViewRow::Service(_))));
+
+        let mut app = app;
+        app.set_view_mode(ViewMode::Connections);
+        assert_eq!(app.row_count(), 2);
+        assert!(app
+            .visible_rows()
+            .all(|row| matches!(row, ViewRow::Connection { .. })));
+        assert!(app.visible_rows().any(|row| {
+            matches!(
+                row,
+                ViewRow::Connection { connection, .. } if connection.remote.port == 52000
+            )
+        }));
+
+        app.set_view_mode(ViewMode::All);
+        assert_eq!(app.row_count(), 4);
+        assert_eq!(
+            app.visible_rows()
+                .filter(|row| matches!(row, ViewRow::Service(_)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            app.visible_rows()
+                .filter(|row| matches!(row, ViewRow::Connection { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn connection_filtering_is_conjunctive_and_uses_connection_fields() {
+        let mut listener = service(8080, 7, SocketState::Listening);
+        listener.add_connection(connection(8080, 7, 51000));
+        let mut app = App::from_services(vec![listener]);
+        app.set_view_mode(ViewMode::Connections);
+
+        app.search_query = "51000 proc-7".to_owned();
+        app.recompute_visible();
+        assert_eq!(app.row_count(), 1);
+
+        app.search_query = "51000 missing".to_owned();
+        app.recompute_visible();
+        assert_eq!(app.row_count(), 0);
+    }
+
+    #[test]
+    fn selection_survives_binding_address_changes() {
+        let selected = service(8080, 7, SocketState::Listening);
+        let mut app = App::from_services(vec![selected]);
+        let key = app.selected_service_key();
+        app.replace_services(vec![ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 8080),
+            SocketState::Listening,
+            ProcessMetadata::new(7, "proc-7"),
+            None,
+        )]);
+        assert_eq!(app.selected_service_key(), key);
+        assert_eq!(
+            app.selected_service().map(|service| service.local.address),
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)))
+        );
+    }
+
     #[test]
     fn selection_follows_stable_socket_identity_when_rows_reorder() {
         let mut app = App::from_services(vec![
@@ -763,7 +1088,7 @@ mod tests {
         let selected = app.selected_service_key();
         app.replace_services(vec![
             service(8000, 1, SocketState::Listening),
-            service(9000, 2, SocketState::Established),
+            service(9000, 2, SocketState::Listening),
         ]);
         assert_eq!(app.selected_service_key(), selected);
     }
@@ -790,9 +1115,9 @@ mod tests {
         app.select_visible_index(1);
         let selected = app.selected_service_key();
         app.replace_services(vec![
-            service(7000, 3, SocketState::Established),
+            service(7000, 3, SocketState::Listening),
             service(9000, 2, SocketState::Listening),
-            service(8000, 1, SocketState::Established),
+            service(8000, 1, SocketState::Listening),
         ]);
         assert_eq!(app.selected_service_key(), selected);
     }
@@ -815,7 +1140,6 @@ mod tests {
         app.selected = 99;
         app.selected_key = Some(ServiceKey {
             protocol: Protocol::Tcp,
-            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 7000,
             pid: 3,
         });
