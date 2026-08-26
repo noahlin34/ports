@@ -44,7 +44,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
         key("o", "open a likely HTTP service", theme),
         Line::from(""),
         Line::from(vec![Span::styled("Manage", theme.title())]),
-        key("x / X", "SIGTERM / SIGKILL (both confirm)", theme),
+        key("x", "terminate process (SIGTERM with confirmation)", theme),
+        key(
+            "X",
+            "force-kill process (SIGKILL with type-to-confirm)",
+            theme,
+        ),
         key("q", "quit", theme),
         Line::from(""),
         Line::from(vec![
