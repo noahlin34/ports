@@ -362,6 +362,28 @@ impl App {
         self.selected_key = self.selected_service_key();
     }
 
+    /// Select a row by its position in the currently visible, filtered list.
+    ///
+    /// Pointer coordinates can become stale when the terminal is resized or
+    /// data is refreshed between frames, so an out-of-range row is clamped to
+    /// the last visible row. Empty lists reset to the same neutral state used
+    /// by keyboard selection movement.
+    pub(crate) fn select_visible_index(&mut self, index: usize) {
+        if self.visible.is_empty() {
+            self.selected = 0;
+            self.selected_key = None;
+            return;
+        }
+
+        self.selected = index.min(self.visible.len() - 1);
+        self.selected_key = self.selected_service_key();
+    }
+
+    /// Move selection using the same clamping semantics as keyboard movement.
+    pub(crate) fn move_selection_by(&mut self, delta: isize) {
+        self.move_selection(delta);
+    }
+
     pub fn select_home(&mut self) {
         self.selected = 0;
         self.selected_key = self.selected_service_key();
@@ -744,6 +766,77 @@ mod tests {
             service(9000, 2, SocketState::Established),
         ]);
         assert_eq!(app.selected_service_key(), selected);
+    }
+
+    #[test]
+    fn select_visible_index_tracks_filtered_rows_and_stable_identity() {
+        let mut app = App::from_services(vec![
+            service(9000, 2, SocketState::Listening),
+            service(8000, 1, SocketState::Listening),
+            service(7000, 3, SocketState::Listening),
+        ]);
+
+        app.search_query = "8000".to_owned();
+        app.recompute_visible();
+        assert_eq!(app.visible.len(), 1);
+        app.select_visible_index(0);
+        assert_eq!(
+            app.selected_service().map(|service| service.local.port),
+            Some(8000)
+        );
+
+        app.search_query.clear();
+        app.recompute_visible();
+        app.select_visible_index(1);
+        let selected = app.selected_service_key();
+        app.replace_services(vec![
+            service(7000, 3, SocketState::Established),
+            service(9000, 2, SocketState::Listening),
+            service(8000, 1, SocketState::Established),
+        ]);
+        assert_eq!(app.selected_service_key(), selected);
+    }
+
+    #[test]
+    fn select_visible_index_clamps_and_handles_empty_filtered_rows() {
+        let mut app = App::from_services(vec![
+            service(9000, 2, SocketState::Listening),
+            service(8000, 1, SocketState::Listening),
+            service(7000, 3, SocketState::Listening),
+        ]);
+
+        app.select_visible_index(usize::MAX);
+        assert_eq!(app.selected, app.visible.len() - 1);
+        assert_eq!(app.selected_key, app.selected_service_key());
+
+        app.search_query = "missing".to_owned();
+        app.recompute_visible();
+        assert!(app.visible.is_empty());
+        app.selected = 99;
+        app.selected_key = Some(ServiceKey {
+            protocol: Protocol::Tcp,
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 7000,
+            pid: 3,
+        });
+        app.select_visible_index(0);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_key, None);
+    }
+
+    #[test]
+    fn wheel_movement_uses_app_invariants() {
+        let mut app = App::from_services(vec![
+            service(9000, 2, SocketState::Listening),
+            service(8000, 1, SocketState::Listening),
+            service(7000, 3, SocketState::Listening),
+        ]);
+
+        app.move_selection_by(10);
+        assert_eq!(app.selected, app.visible.len() - 1);
+        app.move_selection_by(-10);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_key, app.selected_service_key());
     }
 
     #[test]
