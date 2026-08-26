@@ -95,6 +95,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     match &app.overlay {
         Overlay::Help => help::render(frame, area, theme),
         Overlay::Search => render_search_overlay(frame, area, app, theme),
+        Overlay::BinaryPath(path) => render_binary_path(frame, area, path, theme),
         Overlay::Confirm(confirmation) => render_confirmation(frame, area, confirmation, theme),
         Overlay::None => {}
     }
@@ -296,7 +297,11 @@ fn render_details(
     let user = service.process.user.as_deref().unwrap_or("—");
     let bind = service.local.to_string();
     let state = service.state.to_string();
-    let process = format!("{} · PID {}", service.process.name, service.process.pid);
+    let process = if service.process.name.is_empty() {
+        format!("PID {}", service.process.pid)
+    } else {
+        format!("{} · PID {}", service.process.name, service.process.pid)
+    };
     let lines = vec![
         detail_line("bind", &bind, theme.exposure(service.scope)),
         detail_line(
@@ -308,7 +313,7 @@ fn render_details(
         detail_line("process", &process, Style::default().fg(theme.text)),
         detail_line("user", user, Style::default().fg(theme.text)),
         detail_line("cwd", &cwd, theme.muted()),
-        detail_line("exec", &executable, theme.muted()),
+        detail_line("binary", &executable, theme.muted()),
         detail_line("command", command, theme.muted()),
     ];
     frame.render_widget(
@@ -459,6 +464,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         Span::raw(" search  "),
         Span::styled("Tab", Style::default().fg(theme.accent)),
         Span::raw(" focus  "),
+        Span::styled("p", Style::default().fg(theme.accent)),
+        Span::raw(" path  "),
         Span::styled("?", Style::default().fg(theme.accent)),
         Span::raw(" help  "),
         Span::styled("q", Style::default().fg(theme.accent)),
@@ -535,6 +542,28 @@ fn render_confirmation(
     );
 }
 
+fn render_binary_path(frame: &mut Frame<'_>, area: Rect, path: &str, theme: Theme) {
+    let modal = centered(
+        area,
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(4),
+    );
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(path)
+            .block(
+                Block::default()
+                    .title("Binary path · Esc closes")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent))
+                    .style(theme.panel()),
+            )
+            .style(Style::default().fg(theme.text))
+            .wrap(Wrap { trim: false }),
+        modal,
+    );
+}
+
 fn detail_line<'a>(label: &'a str, value: &'a str, value_style: Style) -> Line<'a> {
     Line::from(vec![
         Span::styled(format!("{label:<9}"), Theme::default().muted()),
@@ -568,7 +597,9 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::app::App;
+    use ports::model::{Endpoint, ProcessMetadata, Protocol, ServiceRecord, SocketState};
     use ratatui::{backend::TestBackend, Terminal};
+    use std::{net::IpAddr, path::PathBuf};
 
     #[test]
     fn narrow_and_wide_surfaces_render_without_panicking() {
@@ -579,5 +610,83 @@ mod tests {
                 .draw(|frame| render(frame, &App::default()))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn details_show_short_process_name_and_binary_field() {
+        let mut process = ProcessMetadata::new(2710, "remoted");
+        process.executable = Some(PathBuf::from(
+            "/Library/Apple/System/Library/PrivateFrameworks/Remote.framework/Support/remoted",
+        ));
+        process.command = Some(
+            "/Library/Apple/System/Library/PrivateFrameworks/Remote.framework/Support/remoted --flag"
+                .into(),
+        );
+        let service = ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8080),
+            SocketState::Listening,
+            process,
+            None,
+        );
+        let app = App::from_services(vec![service]);
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    app.selected_service(),
+                    false,
+                    Theme::default(),
+                )
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .flat_map(|cell| cell.symbol().chars())
+            .collect::<String>();
+        assert!(rendered.contains("remoted · PID 2710"));
+        assert!(rendered.contains("binary"));
+    }
+
+    #[test]
+    fn binary_path_overlay_renders_complete_long_path() {
+        let mut process = ProcessMetadata::new(2710, "remoted");
+        process.executable = Some(PathBuf::from(
+            "/Library/Apple/System/Library/PrivateFrameworks/Remote.framework/Support/remoted",
+        ));
+        let service = ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8080),
+            SocketState::Listening,
+            process,
+            None,
+        );
+        let mut app = App::from_services(vec![service]);
+        app.show_binary_path();
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .flat_map(|cell| cell.symbol().chars())
+            .collect::<String>();
+        assert!(rendered.contains("Binary path"));
+        assert!(rendered.contains(
+            "/Library/Apple/System/Library/PrivateFrameworks/Remote.framework/Support/r"
+        ));
+        assert!(rendered.contains("emoted"));
     }
 }
