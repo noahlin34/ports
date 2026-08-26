@@ -10,7 +10,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ports::model::{NetworkScope, ServiceRecord};
+use ports::model::{ConnectionRecord, NetworkScope, ServiceRecord};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -21,7 +21,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, ConfirmKind, Focus, Overlay},
+    app::{App, ConfirmKind, Focus, Overlay, ViewMode, ViewRow},
     help,
     theme::Theme,
 };
@@ -60,7 +60,11 @@ pub enum HitTarget {
     DetailsPanel,
     ConnectionsPanel,
     InspectionPanel,
+    ViewServices,
+    ViewConnections,
+    ViewAll,
     FooterSearch,
+    FooterView,
     FooterFocus,
     FooterPath,
     FooterKill,
@@ -144,7 +148,7 @@ struct FooterControl {
 struct FooterLayout {
     left: String,
     refreshed: String,
-    controls: [FooterControl; 6],
+    controls: [FooterControl; 7],
 }
 
 fn text_width(text: &str) -> u16 {
@@ -173,12 +177,13 @@ fn footer_layout(area: Rect, app: &App) -> FooterLayout {
     let prefix_width = text_width(&left)
         .saturating_add(text_width("  "))
         .saturating_add(text_width(&format!("last refresh {refreshed}")))
-        .saturating_add(text_width("                                      "))
+        .saturating_add(text_width("              "))
         .saturating_add(text_width("↑↓/jk"))
         .saturating_add(text_width(" move  "));
 
     let definitions = [
         (HitTarget::FooterSearch, "/", " search"),
+        (HitTarget::FooterView, "←→", " view"),
         (HitTarget::FooterFocus, "Tab", " focus"),
         (HitTarget::FooterPath, "p", " path"),
         (HitTarget::FooterKill, "x", " kill"),
@@ -492,6 +497,29 @@ pub fn build_hit_map(area: Rect, app: &App) -> HitMap {
         ])
         .split(area);
 
+    let header_area = root[0];
+    if header_area.width >= 65 && header_area.height >= 1 {
+        let base_x = header_area.x.saturating_add(33);
+        add_if_fully_visible(
+            &mut hit_map,
+            header_area,
+            Rect::new(base_x, header_area.y, 12, 1),
+            HitTarget::ViewServices,
+        );
+        add_if_fully_visible(
+            &mut hit_map,
+            header_area,
+            Rect::new(base_x + 13, header_area.y, 15, 1),
+            HitTarget::ViewConnections,
+        );
+        add_if_fully_visible(
+            &mut hit_map,
+            header_area,
+            Rect::new(base_x + 29, header_area.y, 7, 1),
+            HitTarget::ViewAll,
+        );
+    }
+
     let body = root[1];
     let (overview_area, details_area, connections_area, inspection_area) = if area.width >= 112 {
         let split = Layout::default()
@@ -527,10 +555,10 @@ pub fn build_hit_map(area: Rect, app: &App) -> HitMap {
     hit_map.add(overview_area, HitTarget::OverviewPanel);
 
     // Overview table rows
-    if !app.visible.is_empty() && overview_area.height >= 4 {
+    if app.visible_count() > 0 && overview_area.height >= 4 {
         let available_rows = overview_area.height.saturating_sub(3) as usize;
-        let offset = calculate_table_offset(app.selected, app.visible.len(), available_rows);
-        let rows_to_display = (app.visible.len().saturating_sub(offset)).min(available_rows);
+        let offset = calculate_table_offset(app.selected, app.visible_count(), available_rows);
+        let rows_to_display = (app.visible_count().saturating_sub(offset)).min(available_rows);
 
         for row_idx in 0..rows_to_display {
             let vis_index = offset + row_idx;
@@ -616,6 +644,18 @@ pub fn handle_mouse_event(
                 }
                 HitTarget::FooterFocus => {
                     app.focus = app.focus.next();
+                }
+                HitTarget::ViewServices => {
+                    app.set_view_mode(crate::app::ViewMode::Services);
+                }
+                HitTarget::ViewConnections => {
+                    app.set_view_mode(crate::app::ViewMode::Connections);
+                }
+                HitTarget::ViewAll => {
+                    app.set_view_mode(crate::app::ViewMode::All);
+                }
+                HitTarget::FooterView => {
+                    app.next_view();
                 }
                 HitTarget::FooterPath => {
                     app.show_binary_path();
@@ -797,18 +837,84 @@ pub fn render_with_hover(frame: &mut Frame<'_>, app: &App, hover: &HoverState) {
     }
 }
 
+fn unfiltered_row_count(app: &App) -> usize {
+    let service_count = match app.current_view() {
+        ViewMode::Services => app
+            .services
+            .iter()
+            .filter(|service| service.state.is_listening())
+            .count(),
+        ViewMode::Connections => 0,
+        ViewMode::All => app.services.len(),
+    };
+    let connection_count = match app.current_view() {
+        ViewMode::Services => 0,
+        ViewMode::Connections | ViewMode::All => app
+            .services
+            .iter()
+            .map(|service| service.active_connections().count())
+            .sum::<usize>(),
+    };
+    service_count + connection_count
+}
+
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
-    let count = app.services.len();
-    let visible = app.visible.len();
+    let mode = app.current_view();
+    let count = unfiltered_row_count(app);
+    let visible = app.visible_count();
     let right = if app.search_query.is_empty() {
-        format!("{visible}/{count} services")
+        format!("{visible}/{count} rows")
     } else {
         format!("{visible}/{count} · /{}", app.search_query)
+    };
+    let (svc_style, conn_style, all_style) = match mode {
+        crate::app::ViewMode::Services => (
+            theme.mode_active(),
+            theme.mode_inactive(),
+            theme.mode_inactive(),
+        ),
+        crate::app::ViewMode::Connections => (
+            theme.mode_inactive(),
+            theme.mode_active(),
+            theme.mode_inactive(),
+        ),
+        crate::app::ViewMode::All => (
+            theme.mode_inactive(),
+            theme.mode_inactive(),
+            theme.mode_active(),
+        ),
     };
     let title = Line::from(vec![
         Span::styled("PORTS", theme.title()),
         Span::styled("  local socket inspector", theme.muted()),
-        Span::raw("                                                    "),
+        Span::raw("    "),
+        Span::styled(
+            if mode == crate::app::ViewMode::Services {
+                "[ Services ]"
+            } else {
+                "  Services  "
+            },
+            svc_style,
+        ),
+        Span::raw(" "),
+        Span::styled(
+            if mode == crate::app::ViewMode::Connections {
+                "[ Connections ]"
+            } else {
+                "  Connections  "
+            },
+            conn_style,
+        ),
+        Span::raw(" "),
+        Span::styled(
+            if mode == crate::app::ViewMode::All {
+                "[ All ]"
+            } else {
+                "  All  "
+            },
+            all_style,
+        ),
+        Span::raw("               "),
         Span::styled(right, theme.muted()),
     ]);
     let block = Block::default()
@@ -831,10 +937,14 @@ fn render_wide(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverState,
     if app.focus == Focus::Inspection {
         render_inspection(frame, split[1], app, hover, theme);
     } else {
+        let selected_row = app.selected_row();
+        let selected_service = selected_row.map(|row| row.service());
+        let selected_connection = selected_row.and_then(|row| row.connection());
         render_details(
             frame,
             right[0],
-            app.selected_service(),
+            selected_service,
+            selected_connection,
             app.focus == Focus::Connections,
             hover,
             theme,
@@ -842,7 +952,7 @@ fn render_wide(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverState,
         render_connections(
             frame,
             right[1],
-            app.selected_service(),
+            selected_service,
             app.focus == Focus::Connections,
             hover,
             theme,
@@ -863,10 +973,12 @@ fn render_narrow(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverStat
     if app.focus == Focus::Inspection {
         render_inspection(frame, split[1], app, hover, theme);
     } else {
+        let selected_row = app.selected_row();
         render_details(
             frame,
             split[1],
-            app.selected_service(),
+            selected_row.map(|row| row.service()),
+            selected_row.and_then(|row| row.connection()),
             app.focus == Focus::Connections,
             hover,
             theme,
@@ -876,9 +988,13 @@ fn render_narrow(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverStat
 
 fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverState, theme: Theme) {
     let title = if app.search_query.is_empty() {
-        "Services".to_owned()
+        format!(
+            "{} · {} visible",
+            app.current_view_label(),
+            app.visible_count()
+        )
     } else {
-        format!("Services · /{}", app.search_query)
+        format!("{} · /{}", app.current_view_label(), app.search_query)
     };
     let border_style = if app.focus == Focus::Overview {
         Style::default().fg(theme.accent)
@@ -893,14 +1009,25 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverSt
         .border_style(border_style)
         .style(theme.panel());
 
-    if app.visible.is_empty() {
+    if app.visible_count() == 0 {
         let message = if let Some(error) = &app.error {
             format!("No service rows\n\n{error}\n\nPress r to retry discovery")
         } else if app.services.is_empty() {
             "No listening services discovered.\n\nPress r to refresh.".to_owned()
-        } else {
-            "No services match this search.\n\nPress / to edit the query or Esc to close search."
+        } else if !app.search_query.is_empty() {
+            "No rows match this search.\n\nPress / to edit the query or Esc to close search."
                 .to_owned()
+        } else {
+            match app.current_view() {
+                ViewMode::Services => {
+                    "No listening services discovered.\n\nPress r to refresh.".to_owned()
+                }
+                ViewMode::Connections => {
+                    "No active connections discovered.\n\nPress ← / → to switch view mode."
+                        .to_owned()
+                }
+                ViewMode::All => "No sockets discovered.\n\nPress r to refresh.".to_owned(),
+            }
         };
         frame.render_widget(
             Paragraph::new(message)
@@ -913,17 +1040,39 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverSt
         return;
     }
 
-    let header = Row::new(vec!["", "BIND", "SCOPE", "PROCESS", "STATE", "PEERS"])
-        .style(theme.muted())
-        .height(1);
+    let mode = app.current_view();
+    let (header, widths) = match mode {
+        ViewMode::Services => (
+            Row::new(vec!["PORT", "PROTO", "SCOPE", "PROCESS"]),
+            [
+                Constraint::Length(8),
+                Constraint::Length(6),
+                Constraint::Length(12),
+                Constraint::Min(20),
+            ],
+        ),
+        ViewMode::Connections => (
+            Row::new(vec!["PORT", "PROTO", "PEER", "STATE"]),
+            [
+                Constraint::Length(8),
+                Constraint::Length(6),
+                Constraint::Min(24),
+                Constraint::Length(15),
+            ],
+        ),
+        ViewMode::All => (
+            Row::new(vec!["PORT", "PROTO", "SCOPE / PEER", "PROCESS / STATE"]),
+            [
+                Constraint::Length(8),
+                Constraint::Length(6),
+                Constraint::Min(18),
+                Constraint::Min(20),
+            ],
+        ),
+    };
+    let header = header.style(theme.muted()).height(1);
 
-    let rows = app.visible.iter().enumerate().map(|(vis_idx, index)| {
-        let service = &app.services[*index];
-        let process = if service.process.name.is_empty() {
-            format!("PID {}", service.process.pid)
-        } else {
-            format!("{}  {}", service.process.name, service.process.pid)
-        };
+    let rows = app.visible_rows().enumerate().map(|(vis_idx, row)| {
         let is_hovered = hover.target == Some(HitTarget::OverviewRow(vis_idx));
         let is_selected = vis_idx == app.selected;
 
@@ -931,43 +1080,89 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverSt
             theme.selected()
         } else if is_hovered {
             theme.hover_row()
-        } else if service.state.is_listening() {
-            theme.good()
         } else {
             Style::default().fg(theme.text)
         };
+        let port_style = if is_selected {
+            theme.selected()
+        } else {
+            theme.port()
+        };
 
-        Row::new(vec![
-            Cell::from(service.protocol.as_str()),
-            Cell::from(service.local.to_string()),
-            Cell::from(scope_badge(service.scope)).style(theme.exposure(service.scope)),
-            Cell::from(process),
-            Cell::from(service.state.to_string()),
-            Cell::from(service.connections.len().to_string()),
-        ])
-        .style(row_style)
+        let cells = match mode {
+            ViewMode::Services => {
+                let service = row.service();
+                let process = if service.process.name.is_empty() {
+                    format!("PID {}", service.process.pid)
+                } else {
+                    format!("{}  {}", service.process.name, service.process.pid)
+                };
+                vec![
+                    Cell::from(service.local.port.to_string()).style(port_style),
+                    Cell::from(service.protocol.as_str()),
+                    Cell::from(scope_badge(service.scope)).style(theme.exposure(service.scope)),
+                    Cell::from(process),
+                ]
+            }
+            ViewMode::Connections => {
+                let connection = row.connection();
+                let port = connection.map_or_else(
+                    || row.service().local.port,
+                    |connection| connection.local.port,
+                );
+                let protocol = connection
+                    .map_or_else(|| row.service().protocol, |connection| connection.protocol);
+                let remote = connection.map_or_else(
+                    || row.service().local.to_string(),
+                    |connection| connection.remote.to_string(),
+                );
+                let state = connection.map_or_else(
+                    || row.service().state.to_string(),
+                    |connection| connection.state.to_string(),
+                );
+                vec![
+                    Cell::from(port.to_string()).style(port_style),
+                    Cell::from(protocol.as_str()),
+                    Cell::from(remote),
+                    Cell::from(state).style(theme.good()),
+                ]
+            }
+            ViewMode::All => match row {
+                ViewRow::Service(service) => {
+                    let process = if service.process.name.is_empty() {
+                        format!("PID {}", service.process.pid)
+                    } else {
+                        format!("{}  {}", service.process.name, service.process.pid)
+                    };
+                    vec![
+                        Cell::from(service.local.port.to_string()).style(port_style),
+                        Cell::from(service.protocol.as_str()),
+                        Cell::from(scope_badge(service.scope)).style(theme.exposure(service.scope)),
+                        Cell::from(process),
+                    ]
+                }
+                ViewRow::Connection { connection, .. } => vec![
+                    Cell::from(connection.local.port.to_string()).style(port_style),
+                    Cell::from(connection.protocol.as_str()),
+                    Cell::from(connection.remote.to_string()),
+                    Cell::from(connection.state.to_string()).style(theme.good()),
+                ],
+            },
+        };
+
+        Row::new(cells).style(row_style)
     });
 
     let mut state = TableState::default();
     state.select(Some(app.selected));
     frame.render_stateful_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(4),
-                Constraint::Length(25),
-                Constraint::Length(13),
-                Constraint::Min(18),
-                Constraint::Length(13),
-                Constraint::Length(6),
-            ],
-        )
-        .header(header)
-        .block(block)
-        .column_spacing(1)
-        .row_highlight_style(theme.selected())
-        .highlight_symbol("▸ ")
-        .style(Style::default().fg(theme.text)),
+        Table::new(rows, widths)
+            .header(header)
+            .block(block)
+            .column_spacing(1)
+            .row_highlight_style(theme.selected())
+            .highlight_symbol("▸ ")
+            .style(Style::default().fg(theme.text)),
         area,
         &mut state,
     );
@@ -977,6 +1172,7 @@ fn render_details(
     frame: &mut Frame<'_>,
     area: Rect,
     service: Option<&ServiceRecord>,
+    connection: Option<&ConnectionRecord>,
     connections_focus: bool,
     hover: &HoverState,
     theme: Theme,
@@ -989,7 +1185,11 @@ fn render_details(
         theme.border()
     };
     let block = Block::default()
-        .title("Selected service")
+        .title(if connection.is_some() {
+            "Selected connection"
+        } else {
+            "Selected service"
+        })
         .borders(Borders::ALL)
         .border_style(border_style)
         .style(theme.panel());
@@ -1003,7 +1203,66 @@ fn render_details(
         );
         return;
     };
-    let command = service.process.command.as_deref().unwrap_or("—");
+
+    if let Some(connection) = connection {
+        let remote = connection.remote.to_string();
+        let local = connection.local.to_string();
+        let protocol = connection.protocol.to_string();
+        let state = connection.state.to_string();
+        let process = if connection.process.name.is_empty() {
+            "—".to_owned()
+        } else {
+            connection.process.name.clone()
+        };
+        let pid = connection.process.pid.to_string();
+        let scope = connection.scope.description();
+        let lines = vec![
+            detail_line("remote", &remote, theme.exposure(connection.scope)),
+            detail_line("state", &state, theme.good()),
+            detail_line("local", &local, theme.exposure(connection.scope)),
+            detail_line("protocol", &protocol, Style::default().fg(theme.text)),
+            detail_line("process", &process, Style::default().fg(theme.text)),
+            detail_line("pid", &pid, Style::default().fg(theme.text)),
+            detail_line("scope", scope, theme.exposure(connection.scope)),
+        ];
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+
+    let bindings = if service.bindings.is_empty() {
+        service.local.to_string()
+    } else {
+        service
+            .bindings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let state = service.state.to_string();
+    let process = if service.process.name.is_empty() {
+        "—".to_owned()
+    } else {
+        service.process.name.clone()
+    };
+    let pid = service.process.pid.to_string();
+    let user = service.process.user.as_deref().unwrap_or("—");
+    let project = service
+        .service
+        .as_deref()
+        .or_else(|| {
+            service
+                .process
+                .cwd
+                .as_deref()
+                .and_then(|cwd| cwd.file_name().and_then(|name| name.to_str()))
+        })
+        .unwrap_or("—");
     let cwd = service
         .process
         .cwd
@@ -1014,16 +1273,9 @@ fn render_details(
         .executable
         .as_deref()
         .map_or_else(|| "—".to_owned(), |path| path.display().to_string());
-    let user = service.process.user.as_deref().unwrap_or("—");
-    let bind = service.local.to_string();
-    let state = service.state.to_string();
-    let process = if service.process.name.is_empty() {
-        format!("PID {}", service.process.pid)
-    } else {
-        format!("{} · PID {}", service.process.name, service.process.pid)
-    };
-    let lines = vec![
-        detail_line("bind", &bind, theme.exposure(service.scope)),
+
+    let mut lines = vec![
+        detail_line("bindings", &bindings, theme.exposure(service.scope)),
         detail_line(
             "scope",
             service.scope.description(),
@@ -1031,17 +1283,48 @@ fn render_details(
         ),
         detail_line("state", &state, theme.good()),
         detail_line("process", &process, Style::default().fg(theme.text)),
+        detail_line("pid", &pid, Style::default().fg(theme.text)),
         detail_line("user", user, Style::default().fg(theme.text)),
+        detail_line("project", project, theme.muted()),
         detail_line("cwd", &cwd, theme.muted()),
         detail_line("binary", &executable, theme.muted()),
-        detail_line("command", command, theme.muted()),
     ];
+
+    if let Some(cmd) = useful_command(
+        service.process.command.as_deref(),
+        service.process.executable.as_deref(),
+        &service.process.name,
+    ) {
+        lines.push(detail_line("command", cmd, theme.muted()));
+    }
+
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn useful_command<'a>(
+    command: Option<&'a str>,
+    executable: Option<&std::path::Path>,
+    name: &str,
+) -> Option<&'a str> {
+    let command = command?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    if let Some(exe) = executable {
+        let exe_str = exe.to_string_lossy();
+        if command == exe_str.trim() {
+            return None;
+        }
+    }
+    if command == name.trim() {
+        return None;
+    }
+    Some(command)
 }
 
 fn render_connections(
@@ -1076,7 +1359,7 @@ fn render_connections(
     };
     if service.connections.is_empty() {
         frame.render_widget(
-            Paragraph::new("No peer connections reported for this bind.")
+            Paragraph::new("No peer connections reported for this listener.")
                 .block(block)
                 .style(theme.muted()),
             area,
@@ -1181,7 +1464,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, hover: &HoverStat
         Span::styled(footer.left, left_style),
         Span::raw("  "),
         Span::styled(format!("last refresh {}", footer.refreshed), theme.muted()),
-        Span::raw("                                      "),
+        Span::raw("              "),
         Span::styled("↑↓/jk", Style::default().fg(theme.accent)),
         Span::raw(" move  "),
     ];
@@ -1500,7 +1783,7 @@ fn render_binary_path(
 
 fn detail_line<'a>(label: &'a str, value: &'a str, value_style: Style) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("{label:<9}"), Theme::default().muted()),
+        Span::styled(format!("{label:<10}"), Theme::default().muted()),
         Span::styled(value, value_style),
     ])
 }
@@ -1531,9 +1814,34 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::app::App;
-    use ports::model::{Endpoint, ProcessMetadata, Protocol, ServiceRecord, SocketState};
+    use ports::model::{
+        ConnectionRecord, Endpoint, ProcessMetadata, Protocol, ServiceRecord, SocketState,
+    };
     use ratatui::{backend::TestBackend, Terminal};
     use std::{net::IpAddr, path::PathBuf};
+
+    fn rendered_buffer(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .flat_map(|cell| cell.symbol().chars())
+            .collect()
+    }
+
+    fn make_test_connection(local_port: u16, remote: (u8, u16)) -> ConnectionRecord {
+        ConnectionRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), local_port),
+            Endpoint::new(
+                IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, remote.0)),
+                remote.1,
+            ),
+            SocketState::Established,
+            ProcessMetadata::new(4200, "webserver"),
+        )
+    }
 
     fn make_test_service(pid: u32, name: &str, port: u16) -> ServiceRecord {
         ServiceRecord::new(
@@ -1543,6 +1851,76 @@ mod tests {
             ProcessMetadata::new(pid, name),
             None,
         )
+    }
+
+    #[test]
+    fn connections_show_distinct_peers_and_same_mode_counts() {
+        let mut service = make_test_service(4200, "webserver", 8080);
+        service.add_connection(make_test_connection(8080, (10, 51000)));
+        service.add_connection(make_test_connection(8080, (11, 51001)));
+
+        let mut standalone = ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9090),
+            SocketState::Established,
+            ProcessMetadata::new(4300, "worker"),
+            None,
+        );
+        let mut standalone_connection = make_test_connection(9090, (12, 51002));
+        standalone_connection.process = ProcessMetadata::new(4300, "worker");
+        standalone.add_connection(standalone_connection);
+
+        let mut app = App::from_services(vec![service, standalone]);
+        app.set_view_mode(ViewMode::Connections);
+
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = rendered_buffer(&terminal);
+        assert!(rendered.contains("PEER"));
+        assert!(rendered.contains("STATE"));
+        assert!(rendered.contains("192.0.2.10:51000"));
+        assert!(rendered.contains("192.0.2.11:51001"));
+        assert!(rendered.contains("192.0.2.12:51002"));
+        assert!(rendered.contains("3/3 rows"));
+
+        app.search_query = "51000".to_owned();
+        app.recompute_visible();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = rendered_buffer(&terminal);
+        assert!(rendered.contains("1/3"));
+
+        app.search_query.clear();
+        app.set_view_mode(ViewMode::All);
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = rendered_buffer(&terminal);
+        assert!(rendered.contains("5/5 rows"));
+
+        app.search_query = "51001".to_owned();
+        app.recompute_visible();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = rendered_buffer(&terminal);
+        assert!(rendered.contains("2/5"));
+    }
+
+    #[test]
+    fn narrow_selected_connection_details_show_remote_and_state() {
+        let mut service = make_test_service(4200, "webserver", 8080);
+        service.add_connection(make_test_connection(8080, (10, 51000)));
+        let mut app = App::from_services(vec![service]);
+        app.set_view_mode(ViewMode::Connections);
+        app.focus = Focus::Connections;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = rendered_buffer(&terminal);
+
+        assert!(rendered.contains("Selected connection"));
+        assert!(rendered.contains("remote"));
+        assert!(rendered.contains("192.0.2.10:51000"));
+        assert!(rendered.contains("state"));
+        assert!(rendered.contains("ESTABLISHED"));
     }
 
     #[test]
@@ -1557,7 +1935,7 @@ mod tests {
     }
 
     #[test]
-    fn details_show_short_process_name_and_binary_field() {
+    fn details_show_bindings_process_and_binary_field() {
         let mut process = ProcessMetadata::new(2710, "remoted");
         process.executable = Some(PathBuf::from(
             "/Library/Apple/System/Library/PrivateFrameworks/Remote.framework/Support/remoted",
@@ -1583,6 +1961,7 @@ mod tests {
                     frame,
                     frame.area(),
                     app.selected_service(),
+                    None,
                     false,
                     &HoverState::default(),
                     Theme::default(),
@@ -1597,8 +1976,137 @@ mod tests {
             .iter()
             .flat_map(|cell| cell.symbol().chars())
             .collect::<String>();
-        assert!(rendered.contains("remoted · PID 2710"));
+        assert!(rendered.contains("remoted"));
+        assert!(rendered.contains("2710"));
         assert!(rendered.contains("binary"));
+        assert!(rendered.contains("bindings"));
+        assert!(rendered.contains("0.0.0.0:8080"));
+        assert!(rendered.contains("--flag"));
+    }
+
+    #[test]
+    fn redundant_command_omitted_when_same_as_binary() {
+        let mut process = ProcessMetadata::new(3000, "node");
+        process.executable = Some(PathBuf::from("/usr/local/bin/node"));
+        process.command = Some("/usr/local/bin/node".into());
+        let service = ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 3000),
+            SocketState::Listening,
+            process,
+            None,
+        );
+        let app = App::from_services(vec![service]);
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    app.selected_service(),
+                    None,
+                    false,
+                    &HoverState::default(),
+                    Theme::default(),
+                )
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .flat_map(|cell| cell.symbol().chars())
+            .collect::<String>();
+        assert!(!rendered.contains("command"));
+    }
+
+    #[test]
+    fn primary_table_four_column_hierarchy_and_dual_stack_collapse() {
+        let mut service = ServiceRecord::new(
+            Protocol::Tcp,
+            Endpoint::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8080),
+            SocketState::Listening,
+            ProcessMetadata::new(4200, "webserver"),
+            None,
+        );
+        service.bindings.push(Endpoint::new(
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            8080,
+        ));
+        let app = App::from_services(vec![service]);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let lines = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+
+        let service_header = lines
+            .iter()
+            .find(|line| {
+                line.contains("PORT")
+                    && line.contains("PROTO")
+                    && line.contains("SCOPE")
+                    && line.contains("PROCESS")
+            })
+            .expect("Services keeps its four-column header");
+        assert!(!service_header.contains("PEER"));
+        assert!(!service_header.contains("STATE"));
+
+        // Single collapsed row in table for port 8080
+        let port_rows = lines
+            .iter()
+            .filter(|line| line.contains("8080") && line.contains("TCP"))
+            .count();
+        assert_eq!(
+            port_rows, 1,
+            "dual-stack listeners should collapse in the table"
+        );
+
+        // Dual-stack bindings appear separately in detail pane
+        let rendered_all = lines.join("\n");
+        assert!(rendered_all.contains("0.0.0.0:8080"));
+        assert!(rendered_all.contains("[::]:8080"));
+    }
+
+    #[test]
+    fn view_mode_switcher_renders_and_switches_mode() {
+        let app_services = App::default();
+        let mut app_conn = App::default();
+        app_conn.set_view_mode(crate::app::ViewMode::Connections);
+        let mut app_all = App::default();
+        app_all.set_view_mode(crate::app::ViewMode::All);
+
+        for (app, expected_active) in [
+            (&app_services, "[ Services ]"),
+            (&app_conn, "[ Connections ]"),
+            (&app_all, "[ All ]"),
+        ] {
+            let backend = TestBackend::new(120, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .flat_map(|cell| cell.symbol().chars())
+                .collect::<String>();
+            assert!(
+                rendered.contains(expected_active),
+                "header should contain active indicator {expected_active}"
+            );
+        }
     }
 
     #[test]
