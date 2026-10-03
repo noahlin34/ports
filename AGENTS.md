@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Overview
-
+performance is a key concern
 Ports is a macOS-first Rust CLI and Ratatui TUI for answering which local ports and sockets are active, which processes own them, and what actions are safe to take. It is designed for ordinary-user developer workflows; it is not a packet sniffer, port scanner, firewall, or general process monitor.
 
 ## Architecture & Data Flow
